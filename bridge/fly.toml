@@ -1,0 +1,34 @@
+# Fly.io deployment config for the cruzonic-stream-bridge service.
+# Deploy: `fly launch --no-deploy` once to create the app, then `fly deploy`.
+# Set env vars with: `fly secrets set DEEPGRAM_API_KEY=... SUPABASE_SERVICE_ROLE_KEY=...`
+
+app = "cruzonic-stream-bridge"
+primary_region = "ord"   # change to whichever Fly region is closest to your Twilio edge
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  NODE_ENV = "production"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0     # set to 1 if you want zero cold-start latency
+  processes = ["app"]
+
+# Health check — Fly hits /healthz, server responds 200.
+[[http_service.checks]]
+  grace_period = "10s"
+  interval = "30s"
+  method = "GET"
+  timeout = "5s"
+  path = "/healthz"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 256
