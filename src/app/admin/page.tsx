@@ -15,6 +15,7 @@ import {
     type CallCardField,
 } from '@/lib/callCardConfig';
 import { formatPhone, formatDuration as fmtDur } from '@/lib/format';
+import { recordingProxyUrl } from '@/lib/recordings';
 import {
     Settings, BarChart3, Activity, Users, ListChecks, Ban, LayoutGrid,
     Phone, LogOut, RotateCcw, Save, Trash2, ChevronUp, ChevronDown,
@@ -949,7 +950,7 @@ export default function AdminPage() {
                                             <td>
                                                 {log.recording_url ? (
                                                     <audio controls preload="none" className="recording-player">
-                                                        <source src={log.recording_url} type="audio/mpeg" />
+                                                        <source src={recordingProxyUrl(log.recording_url) || ''} type="audio/mpeg" />
                                                     </audio>
                                                 ) : (
                                                     <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>—</span>
