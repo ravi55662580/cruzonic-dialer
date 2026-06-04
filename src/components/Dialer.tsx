@@ -13,14 +13,17 @@ import {
     Phone,
     PhoneOff,
     PhoneIncoming,
+    PhoneOutgoing,
     Mic,
     MicOff,
     Hash,
     PhoneCall,
     X,
     AlertTriangle,
+    Users,
     ICON_DEFAULTS,
 } from '@/components/Icon';
+import { supabase } from '@/lib/supabase';
 
 interface DialerProps {
     onCallStart?: (number: string) => void;
@@ -117,6 +120,26 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
     const [activeNumber, setActiveNumber] = useState<string>('');
     const [showKeypad, setShowKeypad] = useState(false);
     const [cardConfig, setCardConfig] = useState<CallCardField[]>([]);
+
+    // ── Call-transfer state ──────────────────────────────────────────
+    interface TransferOption { id: number | string; agent_name: string; phone_number: string; }
+    interface ConferenceParticipant {
+        id: number; conference_name: string; call_sid: string;
+        role: 'agent' | 'customer' | 'transfer-target' | 'monitor';
+        display_name: string | null; phone_number: string | null;
+        is_muted: boolean; joined_at: string; left_at: string | null;
+    }
+    const [showTransferModal, setShowTransferModal] = useState(false);
+    const [transferOptions, setTransferOptions] = useState<TransferOption[]>([]);
+    const [transferTargetPhone, setTransferTargetPhone] = useState('');
+    const [transferTargetName, setTransferTargetName] = useState('');
+    const [transferBusy, setTransferBusy] = useState(false);
+    const [transferError, setTransferError] = useState('');
+    /** Conference participants (transfer target + monitor) we know about
+     *  via Supabase Realtime. Drives the "Senior connected" indicator. */
+    const [conferenceParticipants, setConferenceParticipants] = useState<ConferenceParticipant[]>([]);
+    /** True once we've kicked off a transfer for the current call. */
+    const [transferInProgress, setTransferInProgress] = useState(false);
     const timerRef = useRef<NodeJS.Timeout | null>(null);
     const durationRef = useRef(0);
     const callSidRef = useRef('');
@@ -182,6 +205,8 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
                     agent_id: agentId,
                     status: agentStatus,
                     current_call_number: activeNumber || '',
+                    // Call SID lets admins listen-in on this exact leg.
+                    current_call_sid: agentStatus === 'on-call' ? callSidRef.current : null,
                 }),
             }).catch(() => { });
         }
@@ -425,6 +450,140 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
         }
     };
 
+    // ── Call transfer (warm) ──────────────────────────────────────────
+    /** Open the transfer modal and lazily load the on-shift senior list. */
+    const openTransferModal = useCallback(async () => {
+        setTransferError('');
+        setShowTransferModal(true);
+        try {
+            const res = await fetch('/api/support-shifts');
+            const data = await res.json();
+            if (Array.isArray(data.shifts)) {
+                // Only show shifts that are currently active (admin's flag).
+                setTransferOptions(
+                    data.shifts.filter((s: TransferOption & { is_active?: boolean }) => s.is_active !== false),
+                );
+            }
+        } catch (err) {
+            console.warn('failed to load transfer options', err);
+        }
+    }, []);
+
+    const closeTransferModal = useCallback(() => {
+        setShowTransferModal(false);
+        setTransferTargetPhone('');
+        setTransferTargetName('');
+        setTransferError('');
+    }, []);
+
+    /** Kick off the warm transfer for the current active call. */
+    const initiateTransfer = useCallback(async () => {
+        const sid = callSidRef.current;
+        if (!sid || !transferTargetPhone.trim()) return;
+        setTransferBusy(true);
+        setTransferError('');
+        try {
+            const res = await fetch('/api/twilio/transfer', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    agentCallSid: sid,
+                    targetPhone: transferTargetPhone.trim(),
+                    targetName: transferTargetName.trim() || undefined,
+                    agentEmail: agentId,
+                }),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || 'Transfer failed');
+            setTransferInProgress(true);
+            setShowTransferModal(false);
+            setTransferTargetPhone('');
+            setTransferTargetName('');
+        } catch (err: unknown) {
+            setTransferError(err instanceof Error ? err.message : 'Transfer failed');
+        } finally {
+            setTransferBusy(false);
+        }
+    }, [transferTargetPhone, transferTargetName, agentId]);
+
+    /** Leave the conference (warm transfer wrap-up). Drops the agent leg
+     *  but lets customer + senior keep talking. */
+    const leaveConference = useCallback(async () => {
+        const sid = callSidRef.current;
+        if (!sid) return;
+        try {
+            await fetch('/api/twilio/leave-conference', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ callSid: sid }),
+            });
+        } catch (err) {
+            console.warn('leave-conference failed', err);
+        }
+        // The agent leg will end shortly via Twilio; UI cleans itself up
+        // through the existing 'disconnect' handler.
+    }, []);
+
+    // Subscribe to conference participants for the active call. When the
+    // senior joins, this Realtime feed flips the indicator to "connected".
+    useEffect(() => {
+        if (!transferInProgress) return;
+        const sid = callSidRef.current;
+        if (!sid) return;
+        const confName = `cf-${sid.replace(/[^A-Za-z0-9]/g, '').slice(0, 24)}`;
+
+        // Prime once in case rows already exist from before subscription.
+        (async () => {
+            const { data } = await supabase
+                .from('conference_participants')
+                .select('*')
+                .eq('conference_name', confName)
+                .order('joined_at', { ascending: true });
+            if (data) setConferenceParticipants(data as ConferenceParticipant[]);
+        })();
+
+        const channel = supabase
+            .channel(`conf-${confName}`)
+            .on(
+                'postgres_changes',
+                {
+                    event: '*',
+                    schema: 'public',
+                    table: 'conference_participants',
+                    filter: `conference_name=eq.${confName}`,
+                },
+                (payload) => {
+                    setConferenceParticipants((prev) => {
+                        const row = payload.new as ConferenceParticipant;
+                        const idx = prev.findIndex((p) => p.call_sid === row.call_sid);
+                        if (idx >= 0) {
+                            const next = [...prev];
+                            next[idx] = row;
+                            return next;
+                        }
+                        return [...prev, row];
+                    });
+                },
+            )
+            .subscribe();
+
+        return () => { supabase.removeChannel(channel); };
+    }, [transferInProgress]);
+
+    // Reset transfer state when the agent's call ends.
+    useEffect(() => {
+        if (agentStatus !== 'on-call') {
+            setTransferInProgress(false);
+            setConferenceParticipants([]);
+        }
+    }, [agentStatus]);
+
+    /** True once the transfer target has actually joined the conference. */
+    const seniorConnected = conferenceParticipants.some(
+        (p) => p.role === 'transfer-target' && !p.left_at && p.joined_at,
+    );
+    const seniorParticipant = conferenceParticipants.find((p) => p.role === 'transfer-target');
+
     // Send DTMF
     const sendDigit = (digit: string) => {
         if (activeCall) {
@@ -619,10 +778,48 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
                         >
                             <Hash {...ICON_DEFAULTS} /> Keypad
                         </button>
+                        {!transferInProgress && (
+                            <button
+                                className="btn-secondary"
+                                onClick={openTransferModal}
+                                title="Transfer this call to a senior"
+                            >
+                                <PhoneOutgoing {...ICON_DEFAULTS} /> Transfer
+                            </button>
+                        )}
+                        {transferInProgress && seniorConnected && (
+                            <button className="btn-secondary" onClick={leaveConference}>
+                                <Users {...ICON_DEFAULTS} /> Hand off &amp; leave
+                            </button>
+                        )}
                         <button className="btn-danger btn-hangup" onClick={hangUp}>
                             <PhoneOff {...ICON_DEFAULTS} /> Hang Up
                         </button>
                     </>
+                )}
+
+                {/* Transfer status banner — shows up the moment we initiate
+                    the warm transfer and morphs once the senior connects. */}
+                {agentStatus === 'on-call' && transferInProgress && (
+                    <div className={`xfer-banner ${seniorConnected ? 'xfer-banner-live' : 'xfer-banner-ringing'}`}>
+                        {seniorConnected ? (
+                            <>
+                                <span className="xfer-dot is-live" />
+                                <div>
+                                    <strong>{seniorParticipant?.display_name || 'Senior'} joined the call</strong>
+                                    <p>You can mute yourself and let them take over, or click <em>Hand off &amp; leave</em>.</p>
+                                </div>
+                            </>
+                        ) : (
+                            <>
+                                <span className="xfer-dot xfer-dot-ringing" />
+                                <div>
+                                    <strong>Calling {seniorParticipant?.display_name || 'Senior'}…</strong>
+                                    <p>Keep talking to the customer — they&rsquo;re still connected.</p>
+                                </div>
+                            </>
+                        )}
+                    </div>
                 )}
 
                 {agentStatus === 'wrap-up' && (
@@ -632,6 +829,82 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
                     </div>
                 )}
             </div>
+
+            {/* ── Transfer modal ── */}
+            {showTransferModal && (
+                <div className="app-modal-backdrop" onClick={closeTransferModal}>
+                    <div className="app-modal" onClick={(e) => e.stopPropagation()}>
+                        <div className="app-modal-head">
+                            <h3><PhoneOutgoing {...ICON_DEFAULTS} size={16} /> Transfer call</h3>
+                            <button className="app-modal-close" onClick={closeTransferModal} aria-label="Close">
+                                <X {...ICON_DEFAULTS} size={14} />
+                            </button>
+                        </div>
+                        <div className="app-modal-body">
+                            <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: '0 0 12px' }}>
+                                The customer will stay on the call with you while we ring the senior.
+                                When they answer, mute yourself or click <em>Hand off &amp; leave</em>.
+                            </p>
+
+                            {transferOptions.length > 0 && (
+                                <>
+                                    <label className="form-group" style={{ marginBottom: 12 }}>
+                                        <span style={{ fontSize: 11, textTransform: 'uppercase', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.05em' }}>
+                                            On-shift seniors
+                                        </span>
+                                        <div className="xfer-options">
+                                            {transferOptions.map((s) => (
+                                                <button
+                                                    key={s.id}
+                                                    type="button"
+                                                    className={`xfer-option ${transferTargetPhone === s.phone_number ? 'is-selected' : ''}`}
+                                                    onClick={() => {
+                                                        setTransferTargetPhone(s.phone_number);
+                                                        setTransferTargetName(s.agent_name);
+                                                    }}
+                                                >
+                                                    <strong>{s.agent_name}</strong>
+                                                    <span>{formatPhone(s.phone_number)}</span>
+                                                </button>
+                                            ))}
+                                        </div>
+                                    </label>
+                                </>
+                            )}
+
+                            <label className="form-group">
+                                <span style={{ fontSize: 11, textTransform: 'uppercase', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.05em' }}>
+                                    Or enter a number
+                                </span>
+                                <input
+                                    type="tel"
+                                    placeholder="+91…"
+                                    value={transferTargetPhone}
+                                    onChange={(e) => setTransferTargetPhone(e.target.value)}
+                                />
+                            </label>
+
+                            {transferError && (
+                                <div className="login-error" style={{ marginTop: 10 }}>
+                                    <AlertTriangle {...ICON_DEFAULTS} size={14} /> {transferError}
+                                </div>
+                            )}
+                        </div>
+                        <div className="app-modal-actions">
+                            <button className="btn-secondary" onClick={closeTransferModal} disabled={transferBusy}>
+                                Cancel
+                            </button>
+                            <button
+                                className="btn-primary"
+                                onClick={initiateTransfer}
+                                disabled={transferBusy || !transferTargetPhone.trim()}
+                            >
+                                {transferBusy ? 'Connecting…' : 'Start transfer'}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 });

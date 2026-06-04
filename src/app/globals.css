@@ -2063,6 +2063,243 @@ body {
 .btn-toggle.off { background: rgba(148, 163, 184, 0.12); }
 .btn-toggle:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 
+/* ─── Transfer banner (in Dialer when a warm transfer is in progress) ── */
+.xfer-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  font-size: 13px;
+  margin-top: 4px;
+  animation: cardMount 0.3s ease-out;
+}
+
+.xfer-banner strong { display: block; color: var(--text-primary); margin-bottom: 2px; }
+.xfer-banner p { margin: 0; font-size: 12px; color: var(--text-muted); line-height: 1.4; }
+.xfer-banner em { color: var(--text-primary); font-style: normal; }
+
+.xfer-banner-ringing { border-color: rgba(245, 158, 11, 0.35); background: rgba(245, 158, 11, 0.07); }
+.xfer-banner-live    { border-color: rgba(16, 185, 129, 0.4);  background: rgba(16, 185, 129, 0.08); }
+
+.xfer-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex: 0 0 10px;
+  margin-top: 4px;
+  position: relative;
+  background: var(--text-muted);
+}
+.xfer-dot.is-live {
+  background: #10b981;
+}
+.xfer-dot.is-live::after {
+  content: '';
+  position: absolute;
+  inset: -4px;
+  border-radius: 50%;
+  background: #10b981;
+  opacity: 0.2;
+  animation: statusHalo 2s ease-in-out infinite;
+}
+.xfer-dot-ringing {
+  background: #f59e0b;
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+/* ─── Transfer modal option list ──────────────────────────────────── */
+.xfer-options {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.xfer-option {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  padding: 10px 12px;
+  text-align: left;
+  cursor: pointer;
+  font-family: inherit;
+  color: var(--text-primary);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  transition: border-color 0.15s, background 0.15s, transform 0.08s;
+}
+.xfer-option:hover { border-color: rgba(249, 115, 22, 0.4); background: var(--bg-card-hover); }
+.xfer-option:active { transform: scale(0.99); }
+.xfer-option:focus-visible { outline: none; box-shadow: var(--focus-ring); border-color: var(--accent); }
+.xfer-option strong { font-size: 13px; }
+.xfer-option span { font-size: 12px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.xfer-option.is-selected {
+  border-color: rgba(249, 115, 22, 0.55);
+  background: linear-gradient(180deg, rgba(249, 115, 22, 0.12), rgba(249, 115, 22, 0.04));
+}
+
+/* ─── Listen-in button (admin Live Status card) ───────────────────── */
+.btn-listen {
+  margin-top: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  background: rgba(59, 130, 246, 0.12);
+  color: #3b82f6;
+  border: 1px solid rgba(59, 130, 246, 0.35);
+  border-radius: 999px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.15s, border-color 0.15s, transform 0.1s;
+}
+.btn-listen:hover { background: rgba(59, 130, 246, 0.22); transform: translateY(-1px); }
+.btn-listen:focus-visible { outline: none; box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.25); }
+
+/* ─── App modal head/body/actions (used by transfer + listen modals) ── */
+.app-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border-color);
+}
+.app-modal-head h3 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.app-modal-close {
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  width: 26px; height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.app-modal-close:hover { color: var(--text-primary); border-color: var(--accent); }
+
+.app-modal-body { padding: 16px 18px; }
+
+.app-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 18px;
+  border-top: 1px solid var(--border-color);
+  background: color-mix(in srgb, var(--bg-secondary) 50%, transparent);
+}
+
+/* ─── Admin Power Dial upload form ───────────────────────────────── */
+.pd-upload-card { gap: 8px; }
+
+.pd-upload-form {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr 1.4fr 1.2fr auto;
+  gap: 10px;
+  align-items: end;
+  margin-top: 10px;
+}
+
+.pd-upload-form .form-group { gap: 4px; }
+
+.pd-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+  font-weight: 700;
+}
+
+.pd-upload-form input[type="text"],
+.pd-upload-form input[type="file"],
+.pd-upload-form select {
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 13px;
+  color: var(--text-primary);
+  font-family: inherit;
+}
+
+.pd-upload-form input[type="file"] {
+  padding: 5px 6px;
+  font-size: 12px;
+}
+
+.pd-upload-form input:focus-visible,
+.pd-upload-form select:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+  border-color: var(--accent);
+}
+
+.pd-submit { white-space: nowrap; }
+
+.pd-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: rgba(59, 130, 246, 0.12);
+  border: 1px solid rgba(59, 130, 246, 0.3);
+  color: #3b82f6;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+@media (max-width: 900px) {
+  .pd-upload-form { grid-template-columns: 1fr 1fr; }
+  .pd-submit { grid-column: 1 / -1; }
+}
+
+/* ─── Agent-side "Assigned" badge on a lead-list card ────────────── */
+.lead-list-assigned {
+  border-color: rgba(59, 130, 246, 0.35) !important;
+}
+.lead-list-assigned::before {
+  background: linear-gradient(90deg, #3b82f6, transparent) !important;
+  opacity: 0.6 !important;
+}
+
+.lead-list-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 2px 8px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #3b82f6;
+  background: rgba(59, 130, 246, 0.14);
+  border: 1px solid rgba(59, 130, 246, 0.35);
+  border-radius: 999px;
+  vertical-align: middle;
+}
+
+.lead-list-notes {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.4;
+  font-style: italic;
+}
+
 .btn-icon-only {
   background: transparent;
   border: 1px solid transparent;

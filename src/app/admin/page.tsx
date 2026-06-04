@@ -18,7 +18,8 @@ import { formatPhone, formatDuration as fmtDur } from '@/lib/format';
 import {
     Settings, BarChart3, Activity, Users, ListChecks, Ban, LayoutGrid,
     Phone, LogOut, RotateCcw, Save, Trash2, ChevronUp, ChevronDown,
-    PhoneIncoming, PhoneOutgoing, X, Check, Clock,
+    PhoneIncoming, PhoneOutgoing, X, Check, Clock, Mic, AlertTriangle,
+    Zap, Upload,
     ICON_DEFAULTS,
 } from '@/components/Icon';
 
@@ -49,6 +50,9 @@ interface AgentLiveStatus {
     agent_name: string;
     status: string;
     current_call_number: string;
+    /** Twilio Call SID — present only while the agent is on a call.
+     *  Used by the admin Listen-in button. */
+    current_call_sid?: string | null;
     last_updated: string;
 }
 
@@ -74,7 +78,26 @@ export default function AdminPage() {
     const router = useRouter();
     const [agents, setAgents] = useState<Agent[]>([]);
     const [callLogs, setCallLogs] = useState<CallLogEntry[]>([]);
-    const [activeSection, setActiveSection] = useState<'analytics' | 'agents' | 'logs' | 'status' | 'dnc' | 'callcard' | 'support'>('analytics');
+    const [activeSection, setActiveSection] = useState<'analytics' | 'agents' | 'logs' | 'status' | 'dnc' | 'callcard' | 'support' | 'powerdial'>('analytics');
+
+    // ── Power Dial: admin-assigned lead lists ──────────────────────
+    interface AssignedLeadList {
+        id: number;
+        name: string;
+        agent_id: string | null;
+        agent_name: string | null;
+        agent_email: string | null;
+        notes: string | null;
+        lead_count: number;
+        created_at: string;
+    }
+    const [assignedLists, setAssignedLists] = useState<AssignedLeadList[]>([]);
+    const [pdName, setPdName] = useState('');
+    const [pdAssignTo, setPdAssignTo] = useState('');
+    const [pdNotes, setPdNotes] = useState('');
+    const [pdFile, setPdFile] = useState<File | null>(null);
+    const [pdBusy, setPdBusy] = useState(false);
+    const [pdError, setPdError] = useState('');
 
     // ── Support section state ──────────────────────────────────────────
     interface SupportShift {
@@ -98,6 +121,173 @@ export default function AdminPage() {
     const [newShiftStart, setNewShiftStart] = useState(9);
     const [newShiftEnd, setNewShiftEnd] = useState(18);
     const [shiftBusy, setShiftBusy] = useState(false);
+
+    // ── Live listen state ─────────────────────────────────────────────
+    const [listenTarget, setListenTarget] = useState<AgentLiveStatus | null>(null);
+    const [listenPhone, setListenPhone] = useState('');
+    const [listenBusy, setListenBusy] = useState(false);
+    const [listenError, setListenError] = useState('');
+    const [listenSuccess, setListenSuccess] = useState('');
+
+    useEffect(() => {
+        // Persist + restore the admin's monitor phone so they don't retype it.
+        if (typeof window === 'undefined') return;
+        const saved = window.localStorage.getItem('cruzonic_admin_listen_phone');
+        if (saved) setListenPhone(saved);
+    }, []);
+
+    // ── Power Dial list fetching + upload ──────────────────────────────
+    const fetchAssignedLists = useCallback(async () => {
+        try {
+            const res = await fetch('/api/lead-lists');
+            const data = await res.json();
+            if (Array.isArray(data.lists)) setAssignedLists(data.lists);
+        } catch (err) {
+            console.warn('fetch assigned lists failed', err);
+        }
+    }, []);
+
+    useEffect(() => {
+        if (activeSection !== 'powerdial') return;
+        fetchAssignedLists();
+    }, [activeSection, fetchAssignedLists]);
+
+    /** Tiny CSV line parser — same logic as the agent's dialer page, kept
+     *  inline here to avoid creating a shared lib until it's worth it. */
+    const parseCsvLine = (line: string): string[] => {
+        const out: string[] = [];
+        let cur = '';
+        let inQ = false;
+        for (let i = 0; i < line.length; i++) {
+            const c = line[i];
+            if (c === '"') {
+                if (inQ && line[i + 1] === '"') { cur += '"'; i++; }
+                else { inQ = !inQ; }
+            } else if (c === ',' && !inQ) {
+                out.push(cur);
+                cur = '';
+            } else {
+                cur += c;
+            }
+        }
+        out.push(cur);
+        return out.map((x) => x.trim());
+    };
+
+    const uploadPowerDial = async (e: React.FormEvent) => {
+        e.preventDefault();
+        if (!pdFile || !pdName.trim()) return;
+        setPdBusy(true);
+        setPdError('');
+
+        try {
+            const text = await pdFile.text();
+            const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
+            if (lines.length < 2) throw new Error('CSV needs a header row + at least 1 lead');
+
+            const headers = parseCsvLine(lines[0]).map((h) => h.toLowerCase());
+            const idx = (...names: string[]) =>
+                names.map((n) => headers.indexOf(n)).find((i) => i >= 0) ?? -1;
+
+            const phoneCol = idx('phone', 'phone_number', 'mobile', 'number');
+            if (phoneCol < 0) throw new Error('CSV must have a "phone" column');
+
+            const leads: Record<string, unknown>[] = [];
+            for (let r = 1; r < lines.length; r++) {
+                const cells = parseCsvLine(lines[r]);
+                const phone = cells[phoneCol] || '';
+                if (!phone) continue;
+                const lead: Record<string, unknown> = {
+                    phone,
+                    first_name: cells[idx('first_name', 'firstname', 'first name')] || '',
+                    last_name: cells[idx('last_name', 'lastname', 'last name')] || '',
+                    company: cells[idx('company', 'organization', 'org')] || '',
+                    email: cells[idx('email')] || '',
+                    city: cells[idx('city')] || '',
+                    state: cells[idx('state')] || '',
+                    custom1: cells[idx('custom1')] || '',
+                    custom2: cells[idx('custom2')] || '',
+                    custom3: cells[idx('custom3')] || '',
+                };
+                // Capture every remaining column verbatim into `extra` so the
+                // agent's Call Card can show them later via callCardConfig.
+                const known = new Set([phoneCol, idx('first_name', 'firstname', 'first name'),
+                    idx('last_name', 'lastname', 'last name'),
+                    idx('company', 'organization', 'org'),
+                    idx('email'), idx('city'), idx('state'),
+                    idx('custom1'), idx('custom2'), idx('custom3')]);
+                const extra: Record<string, string> = {};
+                for (let c = 0; c < headers.length; c++) {
+                    if (known.has(c)) continue;
+                    if (!headers[c]) continue;
+                    extra[headers[c]] = cells[c] || '';
+                }
+                lead.extra = extra;
+                leads.push(lead);
+            }
+
+            const res = await fetch('/api/lead-lists', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    name: pdName.trim(),
+                    agent_id: pdAssignTo || null,
+                    notes: pdNotes.trim() || null,
+                    created_by: profile?.id || null,
+                    leads,
+                }),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || 'Upload failed');
+
+            setSuccess(`Uploaded ${leads.length} leads to "${pdName.trim()}"`);
+            setPdName('');
+            setPdAssignTo('');
+            setPdNotes('');
+            setPdFile(null);
+            fetchAssignedLists();
+        } catch (err: unknown) {
+            setPdError(err instanceof Error ? err.message : 'Upload failed');
+        } finally {
+            setPdBusy(false);
+        }
+    };
+
+    const deleteAssignedList = async (id: number) => {
+        try {
+            await fetch(`/api/lead-lists?id=${id}`, { method: 'DELETE' });
+            fetchAssignedLists();
+        } catch (err) {
+            console.warn('delete list failed', err);
+        }
+    };
+
+    const startListen = async () => {
+        if (!listenTarget?.current_call_sid || !listenPhone.trim()) return;
+        setListenBusy(true);
+        setListenError('');
+        try {
+            const res = await fetch('/api/twilio/monitor', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    agentCallSid: listenTarget.current_call_sid,
+                    adminPhone: listenPhone.trim(),
+                    adminEmail: profile?.email,
+                }),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || 'Listen-in failed');
+            window.localStorage.setItem('cruzonic_admin_listen_phone', listenPhone.trim());
+            setListenSuccess(`Calling ${listenPhone.trim()} — pick up to listen. You'll be muted.`);
+            setTimeout(() => setListenSuccess(''), 5000);
+            setListenTarget(null);
+        } catch (err: unknown) {
+            setListenError(err instanceof Error ? err.message : 'Listen-in failed');
+        } finally {
+            setListenBusy(false);
+        }
+    };
     const [showCreateForm, setShowCreateForm] = useState(false);
     const [newEmail, setNewEmail] = useState('');
     const [newPassword, setNewPassword] = useState('');
@@ -449,6 +639,9 @@ export default function AdminPage() {
                     <button className={`nav-tab ${activeSection === 'support' ? 'active' : ''}`} onClick={() => setActiveSection('support')}>
                         <PhoneIncoming {...ICON_DEFAULTS} /> Support
                     </button>
+                    <button className={`nav-tab ${activeSection === 'powerdial' ? 'active' : ''}`} onClick={() => setActiveSection('powerdial')}>
+                        <Zap {...ICON_DEFAULTS} /> Power Dial
+                    </button>
                     <button className="nav-tab" onClick={() => router.push('/')}>
                         <Phone {...ICON_DEFAULTS} /> Dialer
                     </button>
@@ -585,6 +778,16 @@ export default function AdminPage() {
                                             <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
                                                 Updated: {new Date(live.last_updated).toLocaleTimeString()}
                                             </div>
+                                        )}
+                                        {/* Listen-in button — only when the agent is currently on a call. */}
+                                        {live?.current_call_sid && status === 'on-call' && (
+                                            <button
+                                                className="btn-listen"
+                                                onClick={() => setListenTarget(live)}
+                                                title="Join this call muted — listen without being heard"
+                                            >
+                                                <Mic {...ICON_DEFAULTS} size={12} /> Listen in
+                                            </button>
                                         )}
                                     </div>
                                 );
@@ -1030,6 +1233,141 @@ export default function AdminPage() {
                     </div>
                 )}
 
+                {/* ───── POWER DIAL: admin-assigned lead lists ───── */}
+                {activeSection === 'powerdial' && (
+                    <div className="leads-page">
+                        <div className="leads-toolbar">
+                            <h2 style={{ flex: 1, fontSize: 18, display: 'flex', alignItems: 'center', gap: 8 }}>
+                                <Zap {...ICON_DEFAULTS} size={18} /> Power Dial — assigned lists
+                            </h2>
+                        </div>
+
+                        <div className="support-card pd-upload-card">
+                            <span className="support-label">Upload &amp; assign a CSV</span>
+                            <p className="support-hint" style={{ marginTop: 4 }}>
+                                The assigned agent (and only that agent) sees this list on their dialer
+                                under <strong>Power Dial</strong>. CSV must include a <code>phone</code>
+                                column; extra columns flow through to the agent&rsquo;s Call Card.
+                            </p>
+
+                            <form onSubmit={uploadPowerDial} className="pd-upload-form">
+                                <label className="form-group">
+                                    <span className="pd-label">List name</span>
+                                    <input
+                                        type="text"
+                                        value={pdName}
+                                        onChange={(e) => setPdName(e.target.value)}
+                                        placeholder="e.g. April outbound — Bay Area"
+                                        required
+                                    />
+                                </label>
+                                <label className="form-group">
+                                    <span className="pd-label">Assign to agent</span>
+                                    <select
+                                        value={pdAssignTo}
+                                        onChange={(e) => setPdAssignTo(e.target.value)}
+                                        required
+                                    >
+                                        <option value="">— pick an agent —</option>
+                                        {agents
+                                            .filter((a) => a.is_active && a.role !== 'admin')
+                                            .map((a) => (
+                                                <option key={a.id} value={a.id}>
+                                                    {a.full_name || a.email} ({a.role})
+                                                </option>
+                                            ))}
+                                    </select>
+                                </label>
+                                <label className="form-group pd-notes-group">
+                                    <span className="pd-label">Notes (optional)</span>
+                                    <input
+                                        type="text"
+                                        value={pdNotes}
+                                        onChange={(e) => setPdNotes(e.target.value)}
+                                        placeholder="Brief — what's this list for?"
+                                    />
+                                </label>
+                                <label className="form-group pd-file-group">
+                                    <span className="pd-label">CSV file</span>
+                                    <input
+                                        type="file"
+                                        accept=".csv,text/csv"
+                                        onChange={(e) => setPdFile(e.target.files?.[0] || null)}
+                                        required
+                                    />
+                                </label>
+                                <button
+                                    type="submit"
+                                    className="btn-primary pd-submit"
+                                    disabled={pdBusy || !pdFile || !pdName.trim() || !pdAssignTo}
+                                >
+                                    {pdBusy ? 'Uploading…' : <><Upload {...ICON_DEFAULTS} size={14} /> Upload &amp; assign</>}
+                                </button>
+                            </form>
+                            {pdError && (
+                                <div className="login-error" style={{ marginTop: 10 }}>
+                                    <AlertTriangle {...ICON_DEFAULTS} size={14} /> {pdError}
+                                </div>
+                            )}
+                        </div>
+
+                        <div className="support-card">
+                            <span className="support-label">Existing assigned lists ({assignedLists.length})</span>
+                            <table className="leads-table" style={{ marginTop: 10 }}>
+                                <thead>
+                                    <tr>
+                                        <th>Name</th>
+                                        <th>Assigned to</th>
+                                        <th>Leads</th>
+                                        <th>Created</th>
+                                        <th>Notes</th>
+                                        <th></th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {assignedLists.map((l) => (
+                                        <tr key={l.id}>
+                                            <td><strong>{l.name}</strong></td>
+                                            <td>
+                                                {l.agent_name ? (
+                                                    <span className="pd-pill">
+                                                        <Users {...ICON_DEFAULTS} size={11} /> {l.agent_name}
+                                                    </span>
+                                                ) : (
+                                                    <em style={{ color: 'var(--text-muted)', fontSize: 12 }}>everyone (legacy)</em>
+                                                )}
+                                            </td>
+                                            <td style={{ fontVariantNumeric: 'tabular-nums' }}>{l.lead_count}</td>
+                                            <td style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                                                {new Date(l.created_at).toLocaleDateString()}
+                                            </td>
+                                            <td style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                                                {l.notes || '—'}
+                                            </td>
+                                            <td>
+                                                <button
+                                                    className="btn-icon-only"
+                                                    onClick={() => deleteAssignedList(l.id)}
+                                                    aria-label={`Delete ${l.name}`}
+                                                >
+                                                    <Trash2 {...ICON_DEFAULTS} size={14} />
+                                                </button>
+                                            </td>
+                                        </tr>
+                                    ))}
+                                    {assignedLists.length === 0 && (
+                                        <tr>
+                                            <td colSpan={6} style={{ textAlign: 'center', padding: 30, color: 'var(--text-muted)' }}>
+                                                No lists uploaded yet.
+                                            </td>
+                                        </tr>
+                                    )}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                )}
+
                 {/* Call Card Customization */}
                 {activeSection === 'callcard' && (
                     <div className="leads-page">
@@ -1122,7 +1460,63 @@ export default function AdminPage() {
                 <div style={{ textAlign: 'center', marginTop: 24, color: 'var(--text-muted)', fontSize: 12 }}>
                     Logged in as: {profile?.email} ({profile?.role})
                 </div>
+
+                {listenSuccess && (
+                    <div className="app-toast">
+                        <Check {...ICON_DEFAULTS} size={14} /> {listenSuccess}
+                    </div>
+                )}
             </main>
+
+            {/* ── Listen-in modal ── */}
+            {listenTarget && (
+                <div className="app-modal-backdrop" onClick={() => setListenTarget(null)}>
+                    <div className="app-modal" onClick={(e) => e.stopPropagation()}>
+                        <div className="app-modal-head">
+                            <h3><Mic {...ICON_DEFAULTS} size={16} /> Listen to live call</h3>
+                            <button className="app-modal-close" onClick={() => setListenTarget(null)} aria-label="Close">
+                                <X {...ICON_DEFAULTS} size={14} />
+                            </button>
+                        </div>
+                        <div className="app-modal-body">
+                            <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: '0 0 12px' }}>
+                                You&rsquo;ll be added to <strong>{listenTarget.agent_name}</strong>&rsquo;s
+                                call <strong>muted</strong> — you can hear both sides, but neither side hears you.
+                                We&rsquo;ll call your phone; pick up to listen.
+                            </p>
+                            <label className="form-group">
+                                <span style={{ fontSize: 11, textTransform: 'uppercase', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.05em' }}>
+                                    Your phone number
+                                </span>
+                                <input
+                                    type="tel"
+                                    placeholder="+91…"
+                                    value={listenPhone}
+                                    onChange={(e) => setListenPhone(e.target.value)}
+                                    autoFocus
+                                />
+                            </label>
+                            {listenError && (
+                                <div className="login-error" style={{ marginTop: 10 }}>
+                                    <AlertTriangle {...ICON_DEFAULTS} size={14} /> {listenError}
+                                </div>
+                            )}
+                        </div>
+                        <div className="app-modal-actions">
+                            <button className="btn-secondary" onClick={() => setListenTarget(null)} disabled={listenBusy}>
+                                Cancel
+                            </button>
+                            <button
+                                className="btn-primary"
+                                onClick={startListen}
+                                disabled={listenBusy || !listenPhone.trim()}
+                            >
+                                {listenBusy ? 'Ringing…' : 'Ring my phone'}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }

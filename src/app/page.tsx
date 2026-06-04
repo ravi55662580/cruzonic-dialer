@@ -44,6 +44,10 @@ interface LeadList {
     name: string;
     leads: Lead[];
     createdAt: string;
+    /** True when this list was uploaded by an admin and assigned to me.
+     *  Local CSV uploads are tagged false. */
+    assignedByAdmin?: boolean;
+    notes?: string;
 }
 
 interface CallLog {
@@ -193,13 +197,86 @@ export default function Dashboard() {
         fetchCallbacks();
     }, [profile]);
 
+    // Fetch admin-assigned Power Dial lists for THIS agent and merge them in.
+    // Each assigned list shows up alongside their local CSV uploads but is
+    // tagged so the UI can mark it "Assigned by admin". Re-fetch when the
+    // hydration step finishes so we don't race the localStorage restore.
+    useEffect(() => {
+        if (!profile?.id || !leadListsHydrated) return;
+        let cancelled = false;
+        (async () => {
+            try {
+                const res = await fetch(
+                    `/api/lead-lists?agent_id=${encodeURIComponent(profile.id)}`,
+                );
+                const data = await res.json();
+                const lists = Array.isArray(data.lists) ? data.lists : [];
+                if (!lists.length) return;
+
+                // Pull leads for every assigned list in parallel. Cheap because
+                // RLS already filters at the DB and these are small lists.
+                const enriched = await Promise.all(
+                    lists.map(async (l: { id: number; name: string; notes?: string; created_at: string; lead_count: number }) => {
+                        try {
+                            const r = await fetch(`/api/lead-lists/leads?list_id=${l.id}`);
+                            const j = await r.json();
+                            const leads: Lead[] = (j.leads || []).map((row: Record<string, unknown>) => ({
+                                id: `db-${row.id}`,
+                                phone: (row.phone || '') as string,
+                                firstName: (row.first_name || '') as string,
+                                lastName: (row.last_name || '') as string,
+                                company: (row.company || '') as string,
+                                email: (row.email || '') as string,
+                                city: (row.city || '') as string,
+                                state: (row.state || '') as string,
+                                custom1: (row.custom1 || '') as string,
+                                custom2: (row.custom2 || '') as string,
+                                custom3: (row.custom3 || '') as string,
+                                extra: (row.extra && typeof row.extra === 'object')
+                                    ? row.extra as Record<string, string>
+                                    : {},
+                            }));
+                            return {
+                                id: `db-${l.id}`,
+                                name: l.name,
+                                leads,
+                                createdAt: l.created_at,
+                                assignedByAdmin: true,
+                                notes: l.notes || undefined,
+                            } as LeadList;
+                        } catch {
+                            return null;
+                        }
+                    }),
+                );
+
+                if (cancelled) return;
+                const valid = enriched.filter((x): x is LeadList => x !== null);
+                if (!valid.length) return;
+
+                setLeadLists((prev) => {
+                    // Drop any prior DB lists, then re-attach the fresh batch.
+                    // Local CSV uploads (id without "db-" prefix) are preserved.
+                    const local = prev.filter((l) => !l.id.startsWith('db-'));
+                    return [...local, ...valid];
+                });
+            } catch (err) {
+                console.warn('fetch assigned lists failed', err);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [profile?.id, leadListsHydrated]);
+
     // Persist lead lists to localStorage. Guarded by `leadListsHydrated` so
     // we don't write the empty initial state back over saved data on first
     // render — that would silently delete the user's lists on every reload.
+    // Admin-assigned lists (id prefix "db-") aren't persisted — they're
+    // always re-fetched from the API so role re-assignments take effect.
     useEffect(() => {
         if (!leadListsHydrated) return;
         try {
-            localStorage.setItem('cruzonic_lead_lists', JSON.stringify(leadLists));
+            const localOnly = leadLists.filter((l) => !l.id.startsWith('db-'));
+            localStorage.setItem('cruzonic_lead_lists', JSON.stringify(localOnly));
         } catch (err) {
             console.warn('Failed to persist lead lists:', err);
         }
@@ -870,18 +947,30 @@ export default function Dashboard() {
                                         const newCount = list.leads.filter((l: Lead) => l.status === 'new').length;
                                         const calledCount = list.leads.length - newCount;
                                         return (
-                                            <div key={list.id} className="lead-list-card">
+                                            <div key={list.id} className={`lead-list-card ${list.assignedByAdmin ? 'lead-list-assigned' : ''}`}>
                                                 <div className="lead-list-header">
-                                                    <h3>{list.name}</h3>
-                                                    <button
-                                                        className="btn-danger-small"
-                                                        onClick={() => setPendingDelete(list)}
-                                                        aria-label={`Delete list ${list.name}`}
-                                                        title="Delete list"
-                                                    >
-                                                        <Trash2 {...ICON_DEFAULTS} size={14} />
-                                                    </button>
+                                                    <h3>
+                                                        {list.name}
+                                                        {list.assignedByAdmin && (
+                                                            <span className="lead-list-badge" title="Assigned to you by an admin">
+                                                                Assigned
+                                                            </span>
+                                                        )}
+                                                    </h3>
+                                                    {!list.assignedByAdmin && (
+                                                        <button
+                                                            className="btn-danger-small"
+                                                            onClick={() => setPendingDelete(list)}
+                                                            aria-label={`Delete list ${list.name}`}
+                                                            title="Delete list"
+                                                        >
+                                                            <Trash2 {...ICON_DEFAULTS} size={14} />
+                                                        </button>
+                                                    )}
                                                 </div>
+                                                {list.assignedByAdmin && list.notes && (
+                                                    <p className="lead-list-notes">{list.notes}</p>
+                                                )}
                                                 <div className="lead-list-stats">
                                                     <span>{list.leads.length} total</span>
                                                     <span className="stat-new">{newCount} new</span>

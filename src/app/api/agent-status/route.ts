@@ -15,6 +15,7 @@ export async function GET() {
             agent_id,
             status,
             current_call_number,
+            current_call_sid,
             last_updated
         `);
 
@@ -46,7 +47,7 @@ export async function GET() {
 // PUT: Update agent status
 export async function PUT(request: Request) {
     const body = await request.json();
-    const { agent_id, status, current_call_number } = body;
+    const { agent_id, status, current_call_number, current_call_sid } = body;
 
     if (!agent_id || !status) {
         return NextResponse.json({ error: 'agent_id and status required' }, { status: 400 });
@@ -58,6 +59,7 @@ export async function PUT(request: Request) {
             agent_id,
             status,
             current_call_number: current_call_number || '',
+            current_call_sid: current_call_sid || null,
             last_updated: new Date().toISOString(),
         }], { onConflict: 'agent_id' })
         .select()
