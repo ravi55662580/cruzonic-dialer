@@ -37,7 +37,8 @@ function getServiceClient() {
 export async function POST(request: Request) {
     let body: {
         agentCallSid?: string;
-        adminPhone?: string;
+        adminIdentity?: string;  // email of admin's signed-in dialer (preferred)
+        adminPhone?: string;     // fallback to PSTN ring
         adminEmail?: string;
     };
     try {
@@ -47,10 +48,11 @@ export async function POST(request: Request) {
     }
 
     const agentCallSid = (body.agentCallSid || '').trim();
+    const adminIdentity = (body.adminIdentity || '').trim();
     const adminPhone = (body.adminPhone || '').trim();
-    if (!agentCallSid || !adminPhone) {
+    if (!agentCallSid || (!adminIdentity && !adminPhone)) {
         return NextResponse.json(
-            { error: 'agentCallSid and adminPhone required' },
+            { error: 'agentCallSid and either adminIdentity or adminPhone required' },
             { status: 400 },
         );
     }
@@ -128,9 +130,14 @@ export async function POST(request: Request) {
             }
         }
 
-        // 2) Ring the admin's phone, joining the conference muted.
+        // 2) Ring the admin into the conference muted. Browser identity is
+        //    preferred (no phone needed); PSTN phone is the fallback.
+        const toAddress = adminIdentity
+            ? `client:${adminIdentity}`
+            : adminPhone;
+
         const monitorCall = await client.calls.create({
-            to: adminPhone,
+            to: toAddress,
             from: callerIdForRole('admin'),
             url: `${baseUrl}/api/twilio/conference-join?name=${encodeURIComponent(conferenceName)}&role=monitor&muted=true`,
             method: 'POST',
@@ -143,8 +150,8 @@ export async function POST(request: Request) {
                     conference_name: conferenceName,
                     call_sid: monitorCall.sid,
                     role: 'monitor',
-                    display_name: body.adminEmail || 'Admin',
-                    phone_number: adminPhone,
+                    display_name: body.adminEmail || adminIdentity || 'Admin',
+                    phone_number: adminPhone || (adminIdentity ? `client:${adminIdentity}` : null),
                     is_muted: true,
                 },
                 { onConflict: 'conference_name,call_sid' },

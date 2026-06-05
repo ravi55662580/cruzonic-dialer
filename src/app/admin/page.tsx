@@ -125,17 +125,9 @@ export default function AdminPage() {
 
     // ── Live listen state ─────────────────────────────────────────────
     const [listenTarget, setListenTarget] = useState<AgentLiveStatus | null>(null);
-    const [listenPhone, setListenPhone] = useState('');
     const [listenBusy, setListenBusy] = useState(false);
     const [listenError, setListenError] = useState('');
     const [listenSuccess, setListenSuccess] = useState('');
-
-    useEffect(() => {
-        // Persist + restore the admin's monitor phone so they don't retype it.
-        if (typeof window === 'undefined') return;
-        const saved = window.localStorage.getItem('cruzonic_admin_listen_phone');
-        if (saved) setListenPhone(saved);
-    }, []);
 
     // ── Power Dial list fetching + upload ──────────────────────────────
     const fetchAssignedLists = useCallback(async () => {
@@ -264,7 +256,7 @@ export default function AdminPage() {
     };
 
     const startListen = async () => {
-        if (!listenTarget?.current_call_sid || !listenPhone.trim()) return;
+        if (!listenTarget?.current_call_sid || !profile?.email) return;
         setListenBusy(true);
         setListenError('');
         try {
@@ -273,16 +265,20 @@ export default function AdminPage() {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     agentCallSid: listenTarget.current_call_sid,
-                    adminPhone: listenPhone.trim(),
-                    adminEmail: profile?.email,
+                    // Ring the admin's BROWSER (Twilio Voice SDK identity = email).
+                    adminIdentity: profile.email,
+                    adminEmail: profile.email,
                 }),
             });
             const data = await res.json();
             if (!res.ok) throw new Error(data.error || 'Listen-in failed');
-            window.localStorage.setItem('cruzonic_admin_listen_phone', listenPhone.trim());
-            setListenSuccess(`Calling ${listenPhone.trim()} — pick up to listen. You'll be muted.`);
-            setTimeout(() => setListenSuccess(''), 5000);
+            setListenSuccess(`Ringing your dialer — accept the incoming call to listen (you'll be muted).`);
+            setTimeout(() => setListenSuccess(''), 6000);
             setListenTarget(null);
+            // Pop the dialer in a new tab so the admin can accept the call
+            // without leaving the admin page. If it's already open as another
+            // tab, the OS focuses that one.
+            try { window.open('/', 'cruzonic-dialer'); } catch { /* ignore */ }
         } catch (err: unknown) {
             setListenError(err instanceof Error ? err.message : 'Listen-in failed');
         } finally {
@@ -415,8 +411,14 @@ export default function AdminPage() {
     };
 
     const resetCardConfig = () => {
-        setCardConfig(buildDefaultConfig(knownColumns));
-        setCardSaved(false);
+        const fresh = buildDefaultConfig(knownColumns);
+        setCardConfig(fresh);
+        // Persist immediately so the dialer windows pick up the default — the
+        // old behaviour only changed local form state, so a refresh restored
+        // the previously-saved config.
+        saveCallCardConfig(fresh);
+        setCardSaved(true);
+        window.dispatchEvent(new StorageEvent('storage', { key: 'cruzonic_call_card_config' }));
     };
 
     const createAgent = async (e: React.FormEvent) => {
@@ -1483,20 +1485,14 @@ export default function AdminPage() {
                             <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: '0 0 12px' }}>
                                 You&rsquo;ll be added to <strong>{listenTarget.agent_name}</strong>&rsquo;s
                                 call <strong>muted</strong> — you can hear both sides, but neither side hears you.
-                                We&rsquo;ll call your phone; pick up to listen.
                             </p>
-                            <label className="form-group">
-                                <span style={{ fontSize: 11, textTransform: 'uppercase', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.05em' }}>
-                                    Your phone number
-                                </span>
-                                <input
-                                    type="tel"
-                                    placeholder="+91…"
-                                    value={listenPhone}
-                                    onChange={(e) => setListenPhone(e.target.value)}
-                                    autoFocus
-                                />
-                            </label>
+                            <p style={{ fontSize: 13, color: 'var(--text-primary)', margin: '0 0 6px' }}>
+                                Your <strong>dialer browser</strong> will ring (signed in as <code>{profile?.email}</code>).
+                                Accept the incoming call to start listening.
+                            </p>
+                            <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: 0 }}>
+                                We&rsquo;ll open the dialer in a new tab if it isn&rsquo;t already.
+                            </p>
                             {listenError && (
                                 <div className="login-error" style={{ marginTop: 10 }}>
                                     <AlertTriangle {...ICON_DEFAULTS} size={14} /> {listenError}
@@ -1510,9 +1506,9 @@ export default function AdminPage() {
                             <button
                                 className="btn-primary"
                                 onClick={startListen}
-                                disabled={listenBusy || !listenPhone.trim()}
+                                disabled={listenBusy || !profile?.email}
                             >
-                                {listenBusy ? 'Ringing…' : 'Ring my phone'}
+                                {listenBusy ? 'Ringing…' : 'Ring my dialer'}
                             </button>
                         </div>
                     </div>

@@ -122,7 +122,14 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
     const [cardConfig, setCardConfig] = useState<CallCardField[]>([]);
 
     // ── Call-transfer state ──────────────────────────────────────────
-    interface TransferOption { id: number | string; agent_name: string; phone_number: string; }
+    /** Online colleagues you can transfer to. Identity = their email — used
+     *  to ring their browser via Twilio Voice SDK `client:identity`. */
+    interface TransferOption {
+        id: string;            // agent_id (uuid)
+        agent_name: string;
+        identity: string;      // email
+        role: string;
+    }
     interface ConferenceParticipant {
         id: number; conference_name: string; call_sid: string;
         role: 'agent' | 'customer' | 'transfer-target' | 'monitor';
@@ -131,8 +138,11 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
     }
     const [showTransferModal, setShowTransferModal] = useState(false);
     const [transferOptions, setTransferOptions] = useState<TransferOption[]>([]);
-    const [transferTargetPhone, setTransferTargetPhone] = useState('');
+    const [transferTargetIdentity, setTransferTargetIdentity] = useState('');
     const [transferTargetName, setTransferTargetName] = useState('');
+    /** Off-platform fallback — escalate to an Indian phone number when no
+     *  online colleague is available. */
+    const [transferTargetPhone, setTransferTargetPhone] = useState('');
     const [transferBusy, setTransferBusy] = useState(false);
     const [transferError, setTransferError] = useState('');
     /** Conference participants (transfer target + monitor) we know about
@@ -451,26 +461,46 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
     };
 
     // ── Call transfer (warm) ──────────────────────────────────────────
-    /** Open the transfer modal and lazily load the on-shift senior list. */
+    /** Open the transfer modal and lazily load the list of currently
+     *  online colleagues. Transfer rings their browser via Twilio Voice SDK
+     *  (`client:identity`); the optional phone field is an off-platform
+     *  escape hatch. */
     const openTransferModal = useCallback(async () => {
         setTransferError('');
         setShowTransferModal(true);
         try {
-            const res = await fetch('/api/support-shifts');
-            const data = await res.json();
-            if (Array.isArray(data.shifts)) {
-                // Only show shifts that are currently active (admin's flag).
-                setTransferOptions(
-                    data.shifts.filter((s: TransferOption & { is_active?: boolean }) => s.is_active !== false),
-                );
-            }
+            const [statusRes, agentsRes] = await Promise.all([
+                fetch('/api/agent-status'),
+                fetch('/api/admin/agents'),
+            ]);
+            const statusData = await statusRes.json();
+            const agentsData = await agentsRes.json();
+            const readyIds = new Set<string>(
+                (statusData.statuses || [])
+                    .filter((s: { status?: string }) => s.status === 'ready')
+                    .map((s: { agent_id: string }) => s.agent_id),
+            );
+            const online: TransferOption[] = (agentsData.agents || [])
+                .filter((a: { id: string; email: string; full_name?: string | null; role?: string; is_active?: boolean }) => {
+                    if (!a.is_active) return false;
+                    if (a.id === agentId) return false; // never yourself
+                    return readyIds.has(a.id);
+                })
+                .map((a: { id: string; email: string; full_name?: string | null; role?: string }) => ({
+                    id: a.id,
+                    agent_name: a.full_name || a.email,
+                    identity: a.email,
+                    role: a.role || 'sales',
+                }));
+            setTransferOptions(online);
         } catch (err) {
             console.warn('failed to load transfer options', err);
         }
-    }, []);
+    }, [agentId]);
 
     const closeTransferModal = useCallback(() => {
         setShowTransferModal(false);
+        setTransferTargetIdentity('');
         setTransferTargetPhone('');
         setTransferTargetName('');
         setTransferError('');
@@ -479,7 +509,10 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
     /** Kick off the warm transfer for the current active call. */
     const initiateTransfer = useCallback(async () => {
         const sid = callSidRef.current;
-        if (!sid || !transferTargetPhone.trim()) return;
+        if (!sid) return;
+        const hasIdentity = transferTargetIdentity.trim().length > 0;
+        const hasPhone = transferTargetPhone.trim().length > 0;
+        if (!hasIdentity && !hasPhone) return;
         setTransferBusy(true);
         setTransferError('');
         try {
@@ -488,7 +521,8 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     agentCallSid: sid,
-                    targetPhone: transferTargetPhone.trim(),
+                    targetIdentity: hasIdentity ? transferTargetIdentity.trim() : undefined,
+                    targetPhone: hasPhone ? transferTargetPhone.trim() : undefined,
                     targetName: transferTargetName.trim() || undefined,
                     agentEmail: agentId,
                 }),
@@ -504,7 +538,7 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
         } finally {
             setTransferBusy(false);
         }
-    }, [transferTargetPhone, transferTargetName, agentId]);
+    }, [transferTargetIdentity, transferTargetPhone, transferTargetName, agentId]);
 
     /** Leave the conference (warm transfer wrap-up). Drops the agent leg
      *  but lets customer + senior keep talking. */
@@ -846,41 +880,47 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
                                 When they answer, mute yourself or click <em>Hand off &amp; leave</em>.
                             </p>
 
-                            {transferOptions.length > 0 && (
-                                <>
-                                    <label className="form-group" style={{ marginBottom: 12 }}>
-                                        <span style={{ fontSize: 11, textTransform: 'uppercase', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.05em' }}>
-                                            On-shift seniors
-                                        </span>
-                                        <div className="xfer-options">
-                                            {transferOptions.map((s) => (
-                                                <button
-                                                    key={s.id}
-                                                    type="button"
-                                                    className={`xfer-option ${transferTargetPhone === s.phone_number ? 'is-selected' : ''}`}
-                                                    onClick={() => {
-                                                        setTransferTargetPhone(s.phone_number);
-                                                        setTransferTargetName(s.agent_name);
-                                                    }}
-                                                >
-                                                    <strong>{s.agent_name}</strong>
-                                                    <span>{formatPhone(s.phone_number)}</span>
-                                                </button>
-                                            ))}
-                                        </div>
-                                    </label>
-                                </>
+                            {transferOptions.length > 0 ? (
+                                <label className="form-group" style={{ marginBottom: 12 }}>
+                                    <span style={{ fontSize: 11, textTransform: 'uppercase', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.05em' }}>
+                                        Online colleagues — their browser will ring
+                                    </span>
+                                    <div className="xfer-options">
+                                        {transferOptions.map((s) => (
+                                            <button
+                                                key={s.id}
+                                                type="button"
+                                                className={`xfer-option ${transferTargetIdentity === s.identity ? 'is-selected' : ''}`}
+                                                onClick={() => {
+                                                    setTransferTargetIdentity(s.identity);
+                                                    setTransferTargetName(s.agent_name);
+                                                    setTransferTargetPhone(''); // mutually exclusive
+                                                }}
+                                            >
+                                                <strong>{s.agent_name}</strong>
+                                                <span style={{ textTransform: 'uppercase', fontSize: 10, letterSpacing: '0.04em' }}>{s.role}</span>
+                                            </button>
+                                        ))}
+                                    </div>
+                                </label>
+                            ) : (
+                                <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '0 0 12px' }}>
+                                    No colleagues are online right now. You can still escalate to a phone number below.
+                                </p>
                             )}
 
                             <label className="form-group">
                                 <span style={{ fontSize: 11, textTransform: 'uppercase', color: 'var(--text-muted)', fontWeight: 700, letterSpacing: '0.05em' }}>
-                                    Or enter a number
+                                    Or escalate to a phone number
                                 </span>
                                 <input
                                     type="tel"
                                     placeholder="+91…"
                                     value={transferTargetPhone}
-                                    onChange={(e) => setTransferTargetPhone(e.target.value)}
+                                    onChange={(e) => {
+                                        setTransferTargetPhone(e.target.value);
+                                        if (e.target.value) setTransferTargetIdentity('');
+                                    }}
                                 />
                             </label>
 
@@ -897,7 +937,7 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
                             <button
                                 className="btn-primary"
                                 onClick={initiateTransfer}
-                                disabled={transferBusy || !transferTargetPhone.trim()}
+                                disabled={transferBusy || (!transferTargetIdentity.trim() && !transferTargetPhone.trim())}
                             >
                                 {transferBusy ? 'Connecting…' : 'Start transfer'}
                             </button>

@@ -44,7 +44,8 @@ function getServiceClient() {
 export async function POST(request: Request) {
     let body: {
         agentCallSid?: string;
-        targetPhone?: string;
+        targetIdentity?: string;   // email of an online agent — preferred
+        targetPhone?: string;      // fallback for off-platform escalation
         targetName?: string;
         agentEmail?: string;
     };
@@ -55,10 +56,11 @@ export async function POST(request: Request) {
     }
 
     const agentCallSid = (body.agentCallSid || '').trim();
+    const targetIdentity = (body.targetIdentity || '').trim();
     const targetPhone = (body.targetPhone || '').trim();
-    if (!agentCallSid || !targetPhone) {
+    if (!agentCallSid || (!targetIdentity && !targetPhone)) {
         return NextResponse.json(
-            { error: 'agentCallSid and targetPhone required' },
+            { error: 'agentCallSid and either targetIdentity or targetPhone required' },
             { status: 400 },
         );
     }
@@ -96,14 +98,20 @@ export async function POST(request: Request) {
             client.calls(customerCallSid).update({ url: customerJoinUrl, method: 'POST' }),
         ]);
 
-        // 4) Dial the senior into the same conference. Caller-ID respects the
-        //    inviting agent's role (sales agents dialing from sales number, etc).
-        //    The agent's role isn't always available here; fall back to legacy.
-        const role: AgentRole = 'support'; // safe default for transfers
+        // 4) Dial the senior into the same conference. If a Voice SDK
+        //    identity was provided (online agent), ring their BROWSER —
+        //    Twilio routes `to: 'client:identity'` to whichever browser has
+        //    that Voice SDK Device registered. Otherwise dial the phone
+        //    number (off-platform escalation).
+        const role: AgentRole = 'support'; // safe default for caller-ID
         const fromNumber = callerIdForRole(role);
 
+        const toAddress = targetIdentity
+            ? `client:${targetIdentity}`
+            : targetPhone;
+
         const transferCall = await client.calls.create({
-            to: targetPhone,
+            to: toAddress,
             from: fromNumber,
             url: `${baseUrl}/api/twilio/conference-join?name=${encodeURIComponent(conferenceName)}&role=transfer-target`,
             method: 'POST',
@@ -142,8 +150,8 @@ export async function POST(request: Request) {
                         conference_name: conferenceName,
                         call_sid: transferCall.sid,
                         role: 'transfer-target',
-                        display_name: body.targetName || 'Senior',
-                        phone_number: targetPhone,
+                        display_name: body.targetName || targetIdentity || 'Senior',
+                        phone_number: targetPhone || (targetIdentity ? `client:${targetIdentity}` : null),
                     },
                 ],
                 { onConflict: 'conference_name,call_sid' },
