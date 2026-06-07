@@ -16,6 +16,11 @@ import {
 } from '@/lib/callCardConfig';
 import { formatPhone, formatDuration as fmtDur } from '@/lib/format';
 import { recordingProxyUrl } from '@/lib/recordings';
+import CallLogFilters, {
+    EMPTY_FILTER,
+    matchesFilter,
+    type CallLogFilterState,
+} from '@/components/CallLogFilters';
 import {
     Settings, BarChart3, Activity, Users, ListChecks, Ban, LayoutGrid,
     Phone, LogOut, RotateCcw, Save, Trash2, ChevronUp, ChevronDown,
@@ -125,6 +130,8 @@ export default function AdminPage() {
 
     // ── Live listen state ─────────────────────────────────────────────
     const [listenTarget, setListenTarget] = useState<AgentLiveStatus | null>(null);
+    // Call-log filter state for the admin Logs tab.
+    const [logFilter, setLogFilter] = useState<CallLogFilterState>(EMPTY_FILTER);
     const [listenBusy, setListenBusy] = useState(false);
     const [listenError, setListenError] = useState('');
     const [listenSuccess, setListenSuccess] = useState('');
@@ -911,25 +918,37 @@ export default function AdminPage() {
                 )}
 
                 {/* All Call Logs Section */}
-                {activeSection === 'logs' && (
-                    <div className="logs-page">
-                        <h2 style={{ fontSize: 18, marginBottom: 12 }}>All Agent Call Logs</h2>
-                        <div className="logs-table-container">
-                            <table className="leads-table">
-                                <thead>
-                                    <tr>
-                                        <th>Time</th>
-                                        <th>Agent</th>
-                                        <th>Number</th>
-                                        <th>Direction</th>
-                                        <th>Duration</th>
-                                        <th>Status</th>
-                                        <th>Notes</th>
-                                        <th>Recording</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    {callLogs.map((log) => (
+                {activeSection === 'logs' && (() => {
+                    const filtered = callLogs.filter((log) => matchesFilter(logFilter, log));
+                    const distinctDispositions = Array.from(
+                        new Set(callLogs.map((l) => l.disposition).filter(Boolean) as string[]),
+                    );
+                    return (
+                        <div className="logs-page">
+                            <h2 style={{ fontSize: 18, marginBottom: 12 }}>All Agent Call Logs</h2>
+                            <CallLogFilters
+                                value={logFilter}
+                                onChange={setLogFilter}
+                                dispositions={distinctDispositions}
+                                matchCount={filtered.length}
+                                totalCount={callLogs.length}
+                            />
+                            <div className="logs-table-container">
+                                <table className="leads-table">
+                                    <thead>
+                                        <tr>
+                                            <th>Time</th>
+                                            <th>Agent</th>
+                                            <th>Number</th>
+                                            <th>Direction</th>
+                                            <th>Duration</th>
+                                            <th>Status</th>
+                                            <th>Notes</th>
+                                            <th>Recording</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {filtered.map((log) => (
                                         <tr key={log.id}>
                                             <td>{new Date(log.created_at).toLocaleString()}</td>
                                             <td className="lead-name-cell">{log.agent_name || log.agent_id || '—'}</td>
@@ -960,18 +979,19 @@ export default function AdminPage() {
                                             </td>
                                         </tr>
                                     ))}
-                                    {callLogs.length === 0 && (
-                                        <tr>
-                                            <td colSpan={8} style={{ textAlign: 'center', padding: 40, color: 'var(--text-muted)' }}>
-                                                No call logs yet
-                                            </td>
-                                        </tr>
-                                    )}
-                                </tbody>
-                            </table>
+                                        {filtered.length === 0 && (
+                                            <tr>
+                                                <td colSpan={8} style={{ textAlign: 'center', padding: 40, color: 'var(--text-muted)' }}>
+                                                    {callLogs.length === 0 ? 'No call logs yet' : 'No logs match these filters'}
+                                                </td>
+                                            </tr>
+                                        )}
+                                    </tbody>
+                                </table>
+                            </div>
                         </div>
-                    </div>
-                )}
+                    );
+                })()}
 
                 {/* DNC Section */}
                 {activeSection === 'dnc' && (

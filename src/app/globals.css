@@ -2311,6 +2311,110 @@ body {
 .btn-icon-only:hover { color: #ef4444; border-color: rgba(239, 68, 68, 0.3); background: rgba(239, 68, 68, 0.08); }
 .btn-icon-only:focus-visible { outline: none; box-shadow: var(--focus-ring); }
 
+/* ─── Call-log filter bar (agent + admin) ───────────────────────── */
+.logfilter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 8px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+  background: color-mix(in srgb, var(--bg-card) 85%, transparent);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+}
+
+.logfilter-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  flex: 1 1 220px;
+  min-width: 200px;
+  color: var(--text-muted);
+}
+.logfilter-search input {
+  border: none;
+  outline: none;
+  background: transparent;
+  flex: 1;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text-primary);
+  min-width: 0;
+}
+.logfilter-search input::placeholder { color: var(--text-muted); }
+
+.logfilter-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  font-weight: 700;
+}
+.logfilter-field input,
+.logfilter-field select {
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text-primary);
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.logfilter-field input:focus-visible,
+.logfilter-field select:focus-visible,
+.logfilter-search:focus-within {
+  outline: none;
+  box-shadow: var(--focus-ring);
+  border-color: var(--accent);
+}
+
+.logfilter-meta {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.logfilter-count { white-space: nowrap; }
+
+.logfilter-clear {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  background: transparent;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+.logfilter-clear:hover {
+  color: var(--text-primary);
+  border-color: var(--accent);
+}
+
+@media (max-width: 720px) {
+  .logfilter-bar { padding: 10px; }
+  .logfilter-meta { width: 100%; justify-content: space-between; margin-left: 0; }
+}
+
 @media (max-width: 720px) {
   .shift-form { grid-template-columns: 1fr 1fr; }
 }

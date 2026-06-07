@@ -11,6 +11,11 @@ import { useAuth } from '@/components/AuthProvider';
 import { rememberColumns } from '@/lib/callCardConfig';
 import { formatPhone, formatDuration as fmtDur } from '@/lib/format';
 import { recordingProxyUrl } from '@/lib/recordings';
+import CallLogFilters, {
+    EMPTY_FILTER,
+    matchesFilter,
+    type CallLogFilterState,
+} from '@/components/CallLogFilters';
 import {
     Phone, PhoneCall, Zap, Users, ListChecks, Clock,
     Settings, LogOut, Upload, Trash2, X,
@@ -57,9 +62,14 @@ interface CallLog {
     direction: string;
     duration: number;
     disposition: string;
+    /** Human-readable timestamp (locale string). For display only. */
     timestamp: string;
+    /** ISO timestamp from the DB (or generated when logging locally) —
+     *  required so the date filter has something to compare against. */
+    created_at: string;
     recording_url?: string;
     notes?: string;
+    agent_name?: string;
 }
 
 export default function Dashboard() {
@@ -85,6 +95,8 @@ export default function Dashboard() {
     // Active Twilio Call SID — set when a call connects, cleared when it ends.
     // Drives the LiveCoach transcript subscription.
     const [activeCallSid, setActiveCallSid] = useState<string | null>(null);
+    /** Filter state for the Call Logs tab. */
+    const [logFilter, setLogFilter] = useState<CallLogFilterState>(EMPTY_FILTER);
     // Most recently ENDED call SID. When set (and activeCallSid is null), the
     // LiveCoach panel switches to its "Call wrap-up" view and kicks off the
     // post-call summary.
@@ -151,14 +163,17 @@ export default function Dashboard() {
                 const res = await fetch(`/api/call-logs?agent_id=${encodeURIComponent(agentEmail)}`);
                 const data = await res.json();
                 if (data.logs && data.logs.length > 0) {
-                    const mapped = data.logs.map((log: { id: string; number: string; direction: string; duration: number; disposition: string; created_at: string; recording_url?: string }) => ({
+                    const mapped = data.logs.map((log: { id: string; number: string; direction: string; duration: number; disposition: string; created_at: string; recording_url?: string; notes?: string; agent_name?: string }) => ({
                         id: log.id,
                         number: log.number,
                         direction: log.direction,
                         duration: log.duration,
                         disposition: log.disposition,
                         timestamp: new Date(log.created_at).toLocaleString(),
-                        recording_url: log.recording_url || null,
+                        created_at: log.created_at,
+                        recording_url: log.recording_url || undefined,
+                        notes: log.notes,
+                        agent_name: log.agent_name,
                     }));
                     setCallLogs(mapped);
                 }
@@ -469,6 +484,7 @@ export default function Dashboard() {
             duration,
             disposition,
             timestamp: new Date().toLocaleString(),
+            created_at: new Date().toISOString(),
         };
         setCallLogs((prev) => [log, ...prev]);
 
@@ -539,6 +555,7 @@ export default function Dashboard() {
             duration,
             disposition,
             timestamp: new Date().toLocaleString(),
+            created_at: new Date().toISOString(),
             notes: notes || '',
         };
         setCallLogs(prev => [log, ...prev]);
@@ -798,8 +815,13 @@ export default function Dashboard() {
                                     lastDialedNumberRef.current = num;
                                     console.log('Call started:', num);
                                 }}
-                                onCallEnd={(dur, callSid) => {
-                                    logCall(lastDialedNumberRef.current || selectedLead?.phone || '', dur, 'completed', callSid);
+                                onCallEnd={(dur, callSid, disposition) => {
+                                    logCall(
+                                        lastDialedNumberRef.current || selectedLead?.phone || '',
+                                        dur,
+                                        disposition || 'completed',
+                                        callSid,
+                                    );
                                 }}
                             />
                         </div>
@@ -1040,65 +1062,89 @@ export default function Dashboard() {
                 )}
 
                 {/* Call Logs Tab */}
-                {activeTab === 'logs' && (
-                    <div className="logs-page">
-                        {callLogs.length === 0 ? (
-                            <div className="empty-state">
-                                <div className="empty-icon"><ListChecks {...ICON_DEFAULTS} size={40} /></div>
-                                <h3>No call logs yet</h3>
-                                <p>Make your first call from the Dialer or Power Dialer — it&apos;ll show up here with duration, recording, and disposition.</p>
-                                <button className="btn-primary" onClick={() => setActiveTab('dialer')}>
-                                    <Phone {...ICON_DEFAULTS} /> Open Dialer
-                                </button>
-                            </div>
-                        ) : (
-                            <div className="logs-table-container">
-                                <table className="leads-table">
-                                    <thead>
-                                        <tr>
-                                            <th>Time</th>
-                                            <th>Number</th>
-                                            <th>Direction</th>
-                                            <th>Duration</th>
-                                            <th>Disposition</th>
-                                            <th>Recording</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody>
-                                        {callLogs.map((log) => (
-                                            <tr key={log.id}>
-                                                <td>{log.timestamp}</td>
-                                                <td className="lead-phone-cell">{formatPhone(log.number)}</td>
-                                                <td>
-                                                    <span className={`direction-badge ${log.direction}`}>
-                                                        {log.direction === 'outbound'
-                                                            ? <PhoneOutgoing {...ICON_DEFAULTS} size={13} />
-                                                            : <PhoneIncoming {...ICON_DEFAULTS} size={13} />}
-                                                        {log.direction}
-                                                    </span>
-                                                </td>
-                                                <td>{formatDuration(log.duration)}</td>
-                                                <td>
-                                                    <span className="status-badge status-completed">
-                                                        {log.disposition}
-                                                    </span>
-                                                </td>
-                                                <td>
-                                                    {log.recording_url ? (
-                                                        <audio controls preload="none" className="recording-player">
-                                                            <source src={recordingProxyUrl(log.recording_url) || ''} type="audio/mpeg" />
-                                                        </audio>
-                                                    ) : (
-                                                        <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>—</span>
-                                                    )}
-                                                </td>
-                                            </tr>
-                                        ))}                                    </tbody>
-                                </table>
-                            </div>
-                        )}
-                    </div>
-                )}
+                {activeTab === 'logs' && (() => {
+                    const filteredLogs = callLogs.filter((log) => matchesFilter(logFilter, log));
+                    const distinctDispositions = Array.from(
+                        new Set(callLogs.map((l) => l.disposition).filter(Boolean)),
+                    );
+                    return (
+                        <div className="logs-page">
+                            {callLogs.length === 0 ? (
+                                <div className="empty-state">
+                                    <div className="empty-icon"><ListChecks {...ICON_DEFAULTS} size={40} /></div>
+                                    <h3>No call logs yet</h3>
+                                    <p>Make your first call from the Dialer or Power Dialer — it&apos;ll show up here with duration, recording, and disposition.</p>
+                                    <button className="btn-primary" onClick={() => setActiveTab('dialer')}>
+                                        <Phone {...ICON_DEFAULTS} /> Open Dialer
+                                    </button>
+                                </div>
+                            ) : (
+                                <>
+                                    <CallLogFilters
+                                        value={logFilter}
+                                        onChange={setLogFilter}
+                                        dispositions={distinctDispositions}
+                                        showDirection={true}
+                                        matchCount={filteredLogs.length}
+                                        totalCount={callLogs.length}
+                                    />
+                                    <div className="logs-table-container">
+                                        <table className="leads-table">
+                                            <thead>
+                                                <tr>
+                                                    <th>Time</th>
+                                                    <th>Number</th>
+                                                    <th>Direction</th>
+                                                    <th>Duration</th>
+                                                    <th>Disposition</th>
+                                                    <th>Recording</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                {filteredLogs.map((log) => (
+                                                    <tr key={log.id}>
+                                                        <td>{log.timestamp}</td>
+                                                        <td className="lead-phone-cell">{formatPhone(log.number)}</td>
+                                                        <td>
+                                                            <span className={`direction-badge ${log.direction}`}>
+                                                                {log.direction === 'outbound'
+                                                                    ? <PhoneOutgoing {...ICON_DEFAULTS} size={13} />
+                                                                    : <PhoneIncoming {...ICON_DEFAULTS} size={13} />}
+                                                                {log.direction}
+                                                            </span>
+                                                        </td>
+                                                        <td>{formatDuration(log.duration)}</td>
+                                                        <td>
+                                                            <span className={`status-badge status-${log.disposition || 'completed'}`}>
+                                                                {log.disposition}
+                                                            </span>
+                                                        </td>
+                                                        <td>
+                                                            {log.recording_url ? (
+                                                                <audio controls preload="none" className="recording-player">
+                                                                    <source src={recordingProxyUrl(log.recording_url) || ''} type="audio/mpeg" />
+                                                                </audio>
+                                                            ) : (
+                                                                <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>—</span>
+                                                            )}
+                                                        </td>
+                                                    </tr>
+                                                ))}
+                                                {filteredLogs.length === 0 && (
+                                                    <tr>
+                                                        <td colSpan={6} style={{ textAlign: 'center', padding: 40, color: 'var(--text-muted)' }}>
+                                                            No logs match these filters
+                                                        </td>
+                                                    </tr>
+                                                )}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </>
+                            )}
+                        </div>
+                    );
+                })()}
 
                 {/* Callbacks Tab */}
                 {activeTab === 'callbacks' && (

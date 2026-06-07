@@ -40,28 +40,72 @@ async function lookupRoleForIdentity(identity: string): Promise<AgentRole> {
 }
 
 /**
- * Look up the identities (emails) of sales agents who are currently online
- * and available to take an inbound call. "Online + available" =
- * `agent_status.status === 'ready'` joined with `profiles.role === 'sales'
- * AND profiles.is_active`.
+ * Look up the identities (emails) of sales agents to ring for an inbound
+ * call.
  *
- * Returns the agent emails in last-active order so the freshest sessions
- * ring first when Twilio fans the call out.
+ * Three layers, fall through each in turn:
+ *   1. Agents whose `agent_status.status === 'ready'` (best case — they
+ *      were registered and idle the last time their dialer broadcast).
+ *   2. If nobody's "ready" (e.g. status broadcast missed) but recent
+ *      agent_status rows exist (last 10 min, status NOT in busy set),
+ *      include those.
+ *   3. Last resort: every active sales / admin profile in the org. Twilio
+ *      silently drops `<Dial><Client>` to identities whose Voice SDK
+ *      Devices aren't registered, so this can't ring agents who are truly
+ *      offline — it just guarantees we at least *try*.
+ *
+ * In all cases we exclude agents who are demonstrably busy (on-call /
+ * wrap-up status) so we don't pile a second incoming on top of an active
+ * conversation.
  */
 async function getOnlineSalesAgents(): Promise<string[]> {
     try {
         const { data: statuses } = await supabase
             .from('agent_status')
-            .select('agent_id, status, last_updated')
-            .eq('status', 'ready')
-            .order('last_updated', { ascending: false });
-        if (!statuses || statuses.length === 0) return [];
+            .select('agent_id, status, last_updated');
 
-        const ids = statuses.map((s) => s.agent_id);
+        const allStatuses = statuses || [];
+        const busyIds = new Set(
+            allStatuses
+                .filter((s) => s.status === 'on-call' || s.status === 'wrap-up')
+                .map((s) => s.agent_id),
+        );
+
+        // Layer 1: ready agents.
+        const readyIds = allStatuses
+            .filter((s) => s.status === 'ready')
+            .sort((a, b) => (b.last_updated || '').localeCompare(a.last_updated || ''))
+            .map((s) => s.agent_id);
+
+        let candidateIds = readyIds;
+
+        // Layer 2: recently-seen non-busy agents.
+        if (candidateIds.length === 0) {
+            const tenMinAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+            candidateIds = allStatuses
+                .filter((s) => !busyIds.has(s.agent_id)
+                    && s.last_updated && s.last_updated >= tenMinAgo)
+                .map((s) => s.agent_id);
+        }
+
+        // Layer 3: all active sales / admin profiles.
+        if (candidateIds.length === 0) {
+            const { data: allActive } = await supabase
+                .from('profiles')
+                .select('id')
+                .eq('is_active', true)
+                .in('role', ['sales', 'admin']);
+            candidateIds = (allActive || [])
+                .map((p) => p.id as string)
+                .filter((id) => !busyIds.has(id));
+        }
+
+        if (candidateIds.length === 0) return [];
+
         const { data: profiles } = await supabase
             .from('profiles')
             .select('id, email, role, is_active')
-            .in('id', ids);
+            .in('id', candidateIds);
         if (!profiles) return [];
 
         const eligibleById = new Map(
@@ -69,10 +113,13 @@ async function getOnlineSalesAgents(): Promise<string[]> {
                 .filter((p) => p.is_active && (p.role === 'sales' || p.role === 'admin'))
                 .map((p) => [p.id, p.email as string]),
         );
-        // Preserve the last_updated order from agent_status.
-        return statuses
-            .map((s) => eligibleById.get(s.agent_id))
+
+        const emails = candidateIds
+            .map((id) => eligibleById.get(id))
             .filter((e): e is string => !!e);
+
+        console.log(`[voice] inbound sales fanout to ${emails.length} client(s): ${emails.join(', ')}`);
+        return emails;
     } catch (err) {
         console.error('Error fetching online sales agents:', err);
         return [];

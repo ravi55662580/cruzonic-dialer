@@ -27,7 +27,17 @@ import { supabase } from '@/lib/supabase';
 
 interface DialerProps {
     onCallStart?: (number: string) => void;
-    onCallEnd?: (duration: number, callSid: string) => void;
+    /**
+     * Called when a call ends. `disposition` is:
+     *   'completed' — call was answered, has real talk-time duration
+     *   'no-answer' — rang but never accepted; duration will be 0
+     *   'failed'    — Twilio error before or during the call
+     */
+    onCallEnd?: (
+        duration: number,
+        callSid: string,
+        disposition?: 'completed' | 'no-answer' | 'failed',
+    ) => void;
     onStatusChange?: (status: AgentStatus) => void;
     /**
      * Fires the moment the Twilio Call SID is known (on the `accept` event),
@@ -165,6 +175,11 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
     // this because `activeCall` state isn't set until the 'accept' event,
     // so calls that are still ringing previously had no hang-up handle.
     const currentCallRef = useRef<Call | null>(null);
+    /** True once the customer (or our SDK) actually accepted the call. If
+     *  it stays false through `disconnect`, the call rang but was never
+     *  answered — we log it as no-answer with duration 0 instead of
+     *  inheriting the previous call's duration. */
+    const wasAcceptedRef = useRef(false);
 
     /**
      * Disconnect whatever call is currently ringing, connecting, or active.
@@ -302,6 +317,17 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
         }
     }, [agentId]);
 
+    // Auto-go-online once we know who the agent is. Without this, calls
+    // coming in to the sales number find an empty roster of `ready` agents
+    // and hit the voicemail fallback — even when the agent IS signed in.
+    // This effect runs exactly once per session when agentId becomes known.
+    useEffect(() => {
+        if (!agentId) return;
+        if (device) return;
+        if (agentStatus !== 'offline') return;
+        initDevice();
+    }, [agentId, device, agentStatus, initDevice]);
+
     // Start call timer
     useEffect(() => {
         if (agentStatus === 'on-call') {
@@ -351,12 +377,18 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
             // Track the in-flight call immediately so a Stop / Hang Up issued
             // before the recipient picks up can still kill it.
             currentCallRef.current = call;
+            // Reset accept-tracking + duration on every new call so a missed
+            // call can't inherit the previous call's timer value.
+            wasAcceptedRef.current = false;
+            durationRef.current = 0;
+            setCallDuration(0);
 
             call.on('ringing', () => {
                 setCallStatus('Ringing...');
             });
 
             call.on('accept', () => {
+                wasAcceptedRef.current = true;
                 setAgentStatus('on-call');
                 setActiveCall(call);
                 setCallStatus('');
@@ -371,18 +403,25 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
             call.on('disconnect', () => {
                 setAgentStatus('wrap-up');
                 setCallStatus('');
+                // If the customer never answered, the timer never started, so
+                // duration is 0 and disposition is 'no-answer'. Otherwise the
+                // call was a real conversation — disposition 'completed'.
+                const accepted = wasAcceptedRef.current;
+                const durationToLog = accepted ? durationRef.current : 0;
+                const disposition: 'completed' | 'no-answer' = accepted ? 'completed' : 'no-answer';
                 // Snapshot the call info BEFORE clearing the refs so consumers
                 // (PowerDialer's getLastCallInfo) get accurate values.
                 lastCallInfoRef.current = {
-                    duration: durationRef.current,
+                    duration: durationToLog,
                     callSid: callSidRef.current,
                     number: e164Number,
                 };
-                onCallEnd?.(durationRef.current, callSidRef.current);
+                onCallEnd?.(durationToLog, callSidRef.current, disposition);
                 setActiveCall(null);
                 setActiveNumber('');
                 callSidRef.current = '';
                 currentCallRef.current = null;
+                wasAcceptedRef.current = false;
                 onCallSidChange?.(null);
                 setTimeout(() => setAgentStatus('ready'), 5000);
             });

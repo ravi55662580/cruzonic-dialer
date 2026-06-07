@@ -23,14 +23,28 @@ export async function GET() {
 
         const logs = allLogs || [];
 
-        // 3. Average duration (handle ms vs seconds — clamp unreasonable values)
+        // 3. Average duration — over ANSWERED calls only. Including no-answer
+        //    / missed calls dilutes the metric (a missed call has 0 talk-time
+        //    and shouldn't lower the average). Total duration still sums
+        //    every answered call for the time-on-the-phone tile.
         const parseDuration = (d: number) => {
             if (!d || d < 0) return 0;
-            // If duration > 1 hour, assume it's in milliseconds
+            // If duration > 1 hour stored as raw int, assume it's milliseconds.
             return d > 3600 ? Math.round(d / 1000) : d;
         };
-        const totalDuration = logs.reduce((sum, l) => sum + parseDuration(l.duration), 0);
-        const avgDuration = logs.length > 0 ? Math.round(totalDuration / logs.length) : 0;
+        const NOT_ANSWERED = new Set([
+            'no-answer', 'missed', 'busy', 'failed', 'canceled', 'cancelled', 'no_answer',
+        ]);
+        const answeredLogs = logs.filter(
+            (l) => !NOT_ANSWERED.has((l.disposition || '').toLowerCase()),
+        );
+        const totalDuration = answeredLogs.reduce(
+            (sum, l) => sum + parseDuration(l.duration),
+            0,
+        );
+        const avgDuration = answeredLogs.length > 0
+            ? Math.round(totalDuration / answeredLogs.length)
+            : 0;
 
         // 4. Disposition breakdown
         const dispositions: Record<string, number> = {};
@@ -61,21 +75,33 @@ export async function GET() {
             }
         });
 
-        // 7. Agent performance
-        const agentStats: Record<string, { calls: number; totalDuration: number; name: string }> = {};
-        logs.forEach(l => {
+        // 7. Agent performance — `calls` counts every attempt (so the leaderboard
+        //    reflects effort), but `avgDuration` is over answered calls only
+        //    (so it's not pulled to zero by missed-call rows).
+        const agentStats: Record<string, {
+            calls: number;
+            answered: number;
+            totalDuration: number;
+            name: string;
+        }> = {};
+        logs.forEach((l) => {
             const name = l.agent_name || 'Unknown';
             if (!agentStats[name]) {
-                agentStats[name] = { calls: 0, totalDuration: 0, name };
+                agentStats[name] = { calls: 0, answered: 0, totalDuration: 0, name };
             }
             agentStats[name].calls++;
-            agentStats[name].totalDuration += parseDuration(l.duration);
+            const disp = (l.disposition || '').toLowerCase();
+            if (!NOT_ANSWERED.has(disp)) {
+                agentStats[name].answered++;
+                agentStats[name].totalDuration += parseDuration(l.duration);
+            }
         });
 
-        const agentPerformance = Object.values(agentStats).map(a => ({
+        const agentPerformance = Object.values(agentStats).map((a) => ({
             name: a.name,
             calls: a.calls,
-            avgDuration: a.calls > 0 ? Math.round(a.totalDuration / a.calls) : 0,
+            answered: a.answered,
+            avgDuration: a.answered > 0 ? Math.round(a.totalDuration / a.answered) : 0,
         })).sort((a, b) => b.calls - a.calls);
 
         return NextResponse.json({
