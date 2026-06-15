@@ -9,6 +9,7 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
     "@supabase/supabase-js": "^2.100.0",
     "@twilio/voice-sdk": "^2.18.1",
     "lucide-react": "^0.460.0",

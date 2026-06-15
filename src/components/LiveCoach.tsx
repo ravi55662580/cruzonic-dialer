@@ -15,6 +15,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { supabase } from '@/lib/supabase';
 import { useBrowserStt, type BrowserSttRow } from '@/hooks/useBrowserStt';
+import { useWhisperStt, type WhisperSttRow } from '@/hooks/useWhisperStt';
 
 /** Source of live transcripts:
  *   'realtime' → Supabase Realtime fed by the stream bridge (Phase 1).
@@ -79,6 +80,13 @@ interface Props {
     wrapUpCallSid?: string | null;
     /** Fired when the agent dismisses the wrap-up card. */
     onDismissWrapUp?: () => void;
+    /**
+     * The customer's remote audio MediaStream from Twilio Voice SDK. When
+     * provided in browser-STT mode, LiveCoach feeds it into Whisper for
+     * customer-side transcription on top of the agent's mic capture. Pass
+     * `null` when there's no active call.
+     */
+    customerStream?: MediaStream | null;
 }
 
 /** Sentiment chip colour mapping. */
@@ -103,18 +111,30 @@ const OBJECTION_LABEL: Record<ObjectionKind, string> = {
 /** Debounce window — wait this long after a customer line before asking. */
 const COACH_DEBOUNCE_MS = 1200;
 
-export default function LiveCoach({ callSid, lead, wrapUpCallSid, onDismissWrapUp }: Props) {
-    // ── Browser STT path (free, agent mic only) ─────────────────────────
-    // The hook is always mounted but only `.start()`-ed in browser mode while
-    // a call is active. Keeps the rest of the component shape identical.
+export default function LiveCoach({ callSid, lead, wrapUpCallSid, onDismissWrapUp, customerStream }: Props) {
+    // ── Browser STT path (free, both sides) ─────────────────────────────
+    // Agent mic → Web Speech API. Customer's Twilio remote stream → Whisper
+    // running in-browser (WASM/WebGPU). The two streams' rows are merged
+    // chronologically into a single transcript array the coach panel reads.
     const browser = useBrowserStt();
+    const whisper = useWhisperStt({
+        stream: LIVECOACH_MODE === 'browser' ? customerStream || null : null,
+    });
     const [supabaseRows, setSupabaseRows] = useState<TranscriptRow[]>([]);
-    const rows: (TranscriptRow | BrowserSttRow)[] =
-        LIVECOACH_MODE === 'browser' ? browser.rows : supabaseRows;
+    /** Combined transcript: agent + customer rows interleaved by timestamp
+     *  so the chat bubbles render in conversational order. */
+    const mergedBrowserRows: (BrowserSttRow | WhisperSttRow)[] = [
+        ...browser.rows,
+        ...whisper.rows,
+    ].sort((a, b) => a.created_at.localeCompare(b.created_at));
+    const rows: (TranscriptRow | BrowserSttRow | WhisperSttRow)[] =
+        LIVECOACH_MODE === 'browser' ? mergedBrowserRows : supabaseRows;
     // Realtime-mode subscription status. In browser mode we treat
     // `listening` as the equivalent connected indicator.
     const [connected, setConnected] = useState(false);
-    const connectedNow = LIVECOACH_MODE === 'browser' ? browser.listening : connected;
+    const connectedNow = LIVECOACH_MODE === 'browser'
+        ? (browser.listening || whisper.listening)
+        : connected;
     const [coach, setCoach] = useState<CoachResponse | null>(null);
     const [coaching, setCoaching] = useState(false);
     const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
@@ -128,7 +148,7 @@ export default function LiveCoach({ callSid, lead, wrapUpCallSid, onDismissWrapU
     // to re-run on every row insert, and its cleanup wiped pending timers —
     // so e.g. an agent line typed within 1.2s of a customer line cancelled
     // the coach fetch entirely.)
-    const rowsRef = useRef<(TranscriptRow | BrowserSttRow)[]>(rows);
+    const rowsRef = useRef<(TranscriptRow | BrowserSttRow | WhisperSttRow)[]>(rows);
     const leadRef = useRef<LeadInfo | null | undefined>(lead);
     useEffect(() => { rowsRef.current = rows; }, [rows]);
     useEffect(() => { leadRef.current = lead; }, [lead]);
@@ -236,12 +256,12 @@ export default function LiveCoach({ callSid, lead, wrapUpCallSid, onDismissWrapU
 
     useEffect(() => {
         if (!callSid) return;
-        // In realtime mode (two-sided transcript) we react to NEW final
-        // customer lines. In browser mode (agent mic only) we react to NEW
-        // final agent lines — the customer's side isn't transcribed.
-        const watchSpeaker = LIVECOACH_MODE === 'browser' ? 'agent' : 'customer';
+        // We coach on customer turns — the agent's reply is what we suggest,
+        // so we fetch when the customer just finished saying something. This
+        // is now valid in browser mode too because Whisper transcribes the
+        // remote stream.
         const finalCount = rows.filter(
-            (r) => r.is_final && r.speaker === watchSpeaker,
+            (r) => r.is_final && r.speaker === 'customer',
         ).length;
         if (finalCount === 0) return;
         if (finalCount === lastTriggerLenRef.current) return;
@@ -531,7 +551,14 @@ export default function LiveCoach({ callSid, lead, wrapUpCallSid, onDismissWrapU
                     <span className={`lc-dot ${connectedNow ? 'is-live' : ''}`} />
                     <strong>Live Transcript</strong>
                 </div>
-                <span className="lc-meta">{rows.length} segments</span>
+                <span className="lc-meta">
+                    {whisper.loadingModel && LIVECOACH_MODE === 'browser' && customerStream && (
+                        <span className="lc-model-loading" title="Downloading the Whisper STT model — happens once, cached for next time.">
+                            Loading customer model… {Math.round(whisper.loadProgress * 100)}%
+                        </span>
+                    )}
+                    {!whisper.loadingModel && <>{rows.length} segments</>}
+                </span>
             </div>
 
             <div className="lc-stream" ref={scrollRef}>

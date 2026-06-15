@@ -101,6 +101,10 @@ export default function Dashboard() {
     // LiveCoach panel switches to its "Call wrap-up" view and kicks off the
     // post-call summary.
     const [wrapUpSid, setWrapUpSid] = useState<string | null>(null);
+    // Customer's remote audio stream — populated when a call is accepted.
+    // Drives LiveCoach's in-browser Whisper transcription of the customer
+    // side in browser-STT mode.
+    const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
     const [callbacks, setCallbacks] = useState<{ id: string; phone: string; lead_name: string; scheduled_at: string; notes: string; status: string }[]>([]);
     // CSV upload UI state — replaces native prompt() and alert(), which Chrome
     // and Firefox sometimes auto-dismiss in dev / hosted iframe contexts.
@@ -780,6 +784,13 @@ export default function Dashboard() {
                             <Dialer
                                 ref={dialerRef}
                                 agentId={profile?.id || ''}
+                                // Twilio Voice SDK identity = email. The inbound
+                                // voice route fans out via `<Dial><Client>email</Client>`,
+                                // so the Device must register with the same string.
+                                // Without this, inbound sales calls find no client
+                                // registered as the email, fail the dial, and fall
+                                // through to a 17-minute voicemail cycle.
+                                twilioIdentity={profile?.email || ''}
                                 leadInfo={
                                     selectedLead
                                         ? {
@@ -811,6 +822,7 @@ export default function Dashboard() {
                                         });
                                     }
                                 }}
+                                onRemoteStreamChange={setRemoteStream}
                                 onCallStart={(num) => {
                                     lastDialedNumberRef.current = num;
                                     console.log('Call started:', num);
@@ -836,6 +848,7 @@ export default function Dashboard() {
                             callSid={activeCallSid}
                             wrapUpCallSid={wrapUpSid}
                             onDismissWrapUp={() => setWrapUpSid(null)}
+                            customerStream={remoteStream}
                             lead={
                                 selectedLead
                                     ? {

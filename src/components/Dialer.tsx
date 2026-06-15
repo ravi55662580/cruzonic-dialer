@@ -24,6 +24,7 @@ import {
     ICON_DEFAULTS,
 } from '@/components/Icon';
 import { supabase } from '@/lib/supabase';
+import { findTwilioRemoteStream } from '@/lib/twilioRemoteStream';
 
 interface DialerProps {
     onCallStart?: (number: string) => void;
@@ -45,7 +46,22 @@ interface DialerProps {
      * live-call features like the transcript pane.
      */
     onCallSidChange?: (callSid: string | null) => void;
+    /**
+     * Fires with the customer's remote audio MediaStream once it's available
+     * after a call is accepted, and `null` when the call ends. Used by
+     * LiveCoach in browser-STT mode to feed Whisper for customer-side
+     * transcription.
+     */
+    onRemoteStreamChange?: (stream: MediaStream | null) => void;
+    /** UUID — used for agent_status broadcasts and joining `profiles.id`. */
     agentId?: string;
+    /**
+     * The Voice SDK identity to register with Twilio. Should equal the
+     * agent's email so inbound `<Dial><Client>email</Client>` matches.
+     * Falls back to agentId (UUID) for backward compat — but the inbound
+     * fanout will NOT find the agent unless this is set to the email.
+     */
+    twilioIdentity?: string;
     leadInfo?: {
         name: string;
         company: string;
@@ -117,7 +133,7 @@ export interface DialerHandle {
 
 type AgentStatus = 'offline' | 'connecting' | 'ready' | 'on-call' | 'wrap-up';
 
-const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallStart, onCallEnd, onStatusChange, onCallSidChange, agentId, leadInfo }, ref) {
+const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallStart, onCallEnd, onStatusChange, onCallSidChange, onRemoteStreamChange, agentId, twilioIdentity, leadInfo }, ref) {
     const [device, setDevice] = useState<Device | null>(null);
     const [activeCall, setActiveCall] = useState<Call | null>(null);
     const [agentStatus, setAgentStatus] = useState<AgentStatus>('offline');
@@ -260,10 +276,12 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
         try {
             setError('');
             setAgentStatus('connecting');
-            // Each agent must have a unique Twilio identity, otherwise concurrent
-            // agents hijack each other's voice sessions. Fall back to 'agent-1'
-            // only when no agentId is available (e.g. unauthenticated dev mode).
-            const tokenIdentity = agentId || 'agent-1';
+            // Twilio Voice SDK identity = the agent's email when available.
+            // This MUST match what the inbound voice route dials in
+            // `<Dial><Client>email</Client>`; if Device registers as the
+            // profile.id UUID instead, no inbound call ever reaches the browser.
+            // Falls back to agentId (UUID) and then 'agent-1' for dev/unauth.
+            const tokenIdentity = twilioIdentity || agentId || 'agent-1';
             const response = await fetch('/api/twilio/token', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -315,7 +333,7 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
             setAgentStatus('offline');
             console.error('Init error:', err);
         }
-    }, [agentId]);
+    }, [agentId, twilioIdentity]);
 
     // Auto-go-online once we know who the agent is. Without this, calls
     // coming in to the sales number find an empty roster of `ready` agents
@@ -398,6 +416,15 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
                 console.log('Call SID:', sid);
                 onCallStart?.(target);
                 if (sid) onCallSidChange?.(sid);
+                // Look up the customer's remote audio stream so the LiveCoach
+                // (in browser-STT mode) can feed it to Whisper for the
+                // customer-side transcription. We poll briefly because
+                // Twilio attaches the <audio> element asynchronously.
+                if (onRemoteStreamChange) {
+                    findTwilioRemoteStream().then((stream) => {
+                        if (stream) onRemoteStreamChange(stream);
+                    }).catch(() => { /* swallow — agent-only transcript is fine */ });
+                }
             });
 
             call.on('disconnect', () => {
@@ -423,6 +450,7 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
                 currentCallRef.current = null;
                 wasAcceptedRef.current = false;
                 onCallSidChange?.(null);
+                onRemoteStreamChange?.(null);
                 setTimeout(() => setAgentStatus('ready'), 5000);
             });
 
@@ -433,6 +461,7 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
                 setCallStatus('');
                 currentCallRef.current = null;
                 onCallSidChange?.(null);
+                onRemoteStreamChange?.(null);
             });
 
             call.on('error', (err) => {
@@ -442,6 +471,7 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
                 setCallStatus('');
                 currentCallRef.current = null;
                 onCallSidChange?.(null);
+                onRemoteStreamChange?.(null);
             });
         } catch (err: unknown) {
             const errorMessage = err instanceof Error ? err.message : 'Call failed';
@@ -465,12 +495,20 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
                 callSidRef.current = sid;
                 onCallSidChange?.(sid);
             }
+            // Same as the outbound flow — find the customer's remote stream
+            // and hand it to the parent so LiveCoach can transcribe it.
+            if (onRemoteStreamChange) {
+                findTwilioRemoteStream().then((stream) => {
+                    if (stream) onRemoteStreamChange(stream);
+                }).catch(() => { /* swallow */ });
+            }
 
             incomingCall.on('disconnect', () => {
                 setAgentStatus('wrap-up');
                 setActiveCall(null);
                 callSidRef.current = '';
                 onCallSidChange?.(null);
+                onRemoteStreamChange?.(null);
                 setTimeout(() => setAgentStatus('ready'), 5000);
             });
         }
