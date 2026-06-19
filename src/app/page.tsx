@@ -478,13 +478,19 @@ export default function Dashboard() {
     };
 
     // Log a call — saves to database AND local state
-    const logCall = async (number: string, duration: number, disposition: string, callSid?: string) => {
+    const logCall = async (
+        number: string,
+        duration: number,
+        disposition: string,
+        callSid?: string,
+        direction: 'inbound' | 'outbound' = 'outbound',
+    ) => {
         const agentName = profile?.full_name || profile?.email || 'Unknown';
         const agentId = profile?.email || 'unknown';
         const log: CallLog = {
             id: `log-${Date.now()}`,
             number,
-            direction: 'outbound',
+            direction,
             duration,
             disposition,
             timestamp: new Date().toLocaleString(),
@@ -499,7 +505,7 @@ export default function Dashboard() {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     number,
-                    direction: 'outbound',
+                    direction,
                     duration,
                     disposition,
                     agent_id: agentId,
@@ -827,12 +833,19 @@ export default function Dashboard() {
                                     lastDialedNumberRef.current = num;
                                     console.log('Call started:', num);
                                 }}
-                                onCallEnd={(dur, callSid, disposition) => {
+                                onCallEnd={(dur, callSid, disposition, direction, number) => {
+                                    // For inbound calls, Dialer hands us the caller's phone
+                                    // explicitly because there's no "last dialed number" for it.
+                                    const dir = direction || 'outbound';
+                                    const numberToLog = dir === 'inbound'
+                                        ? (number || '')
+                                        : (lastDialedNumberRef.current || selectedLead?.phone || '');
                                     logCall(
-                                        lastDialedNumberRef.current || selectedLead?.phone || '',
+                                        numberToLog,
                                         dur,
                                         disposition || 'completed',
                                         callSid,
+                                        dir,
                                     );
                                 }}
                             />

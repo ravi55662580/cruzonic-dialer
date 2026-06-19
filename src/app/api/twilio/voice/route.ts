@@ -40,25 +40,22 @@ async function lookupRoleForIdentity(identity: string): Promise<AgentRole> {
 }
 
 /**
- * Look up the identities (emails) of sales agents to ring for an inbound
- * call.
+ * Look up the identities (emails) of agents to ring for an inbound call.
  *
- * Three layers, fall through each in turn:
- *   1. Agents whose `agent_status.status === 'ready'` (best case — they
- *      were registered and idle the last time their dialer broadcast).
- *   2. If nobody's "ready" (e.g. status broadcast missed) but recent
- *      agent_status rows exist (last 10 min, status NOT in busy set),
- *      include those.
- *   3. Last resort: every active sales / admin profile in the org. Twilio
- *      silently drops `<Dial><Client>` to identities whose Voice SDK
- *      Devices aren't registered, so this can't ring agents who are truly
- *      offline — it just guarantees we at least *try*.
+ * Two layers, fall through:
+ *   1. Agents whose `agent_status.status === 'ready'` AND whose row was
+ *      updated within the last 30 minutes (the heartbeat keeps it fresh —
+ *      anything older means the browser tab is closed / laptop asleep).
+ *   2. If nobody fits, recent (<10 min) non-busy agents regardless of
+ *      status — covers wrap-up / connecting state where the dialer is
+ *      effectively alive but didn't get back to 'ready' yet.
  *
- * In all cases we exclude agents who are demonstrably busy (on-call /
- * wrap-up status) so we don't pile a second incoming on top of an active
- * conversation.
+ * Agents demonstrably busy (on-call / wrap-up) are always excluded.
+ *
+ * @param roles  Profile roles eligible to take this call. Sales calls →
+ *               ['sales', 'admin']; support calls → ['support', 'admin'].
  */
-async function getOnlineSalesAgents(): Promise<string[]> {
+async function getOnlineAgentsForRoles(roles: Array<'sales' | 'support' | 'admin'>): Promise<string[]> {
     try {
         const { data: statuses } = await supabase
             .from('agent_status')
@@ -71,33 +68,24 @@ async function getOnlineSalesAgents(): Promise<string[]> {
                 .map((s) => s.agent_id),
         );
 
-        // Layer 1: ready agents.
+        const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+        const tenMinAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+
+        // Layer 1: ready AND fresh.
         const readyIds = allStatuses
-            .filter((s) => s.status === 'ready')
+            .filter((s) => s.status === 'ready'
+                && s.last_updated && s.last_updated >= thirtyMinAgo)
             .sort((a, b) => (b.last_updated || '').localeCompare(a.last_updated || ''))
             .map((s) => s.agent_id);
 
         let candidateIds = readyIds;
 
-        // Layer 2: recently-seen non-busy agents.
+        // Layer 2: recently-seen non-busy.
         if (candidateIds.length === 0) {
-            const tenMinAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
             candidateIds = allStatuses
                 .filter((s) => !busyIds.has(s.agent_id)
                     && s.last_updated && s.last_updated >= tenMinAgo)
                 .map((s) => s.agent_id);
-        }
-
-        // Layer 3: all active sales / admin profiles.
-        if (candidateIds.length === 0) {
-            const { data: allActive } = await supabase
-                .from('profiles')
-                .select('id')
-                .eq('is_active', true)
-                .in('role', ['sales', 'admin']);
-            candidateIds = (allActive || [])
-                .map((p) => p.id as string)
-                .filter((id) => !busyIds.has(id));
         }
 
         if (candidateIds.length === 0) return [];
@@ -110,7 +98,7 @@ async function getOnlineSalesAgents(): Promise<string[]> {
 
         const eligibleById = new Map(
             profiles
-                .filter((p) => p.is_active && (p.role === 'sales' || p.role === 'admin'))
+                .filter((p) => p.is_active && roles.includes(p.role as 'sales' | 'support' | 'admin'))
                 .map((p) => [p.id, p.email as string]),
         );
 
@@ -118,13 +106,16 @@ async function getOnlineSalesAgents(): Promise<string[]> {
             .map((id) => eligibleById.get(id))
             .filter((e): e is string => !!e);
 
-        console.log(`[voice] inbound sales fanout to ${emails.length} client(s): ${emails.join(', ')}`);
+        console.log(`[voice] inbound fanout (${roles.join(',')}) to ${emails.length} client(s): ${emails.join(', ')}`);
         return emails;
     } catch (err) {
-        console.error('Error fetching online sales agents:', err);
+        console.error('[voice] online-agent lookup failed:', err);
         return [];
     }
 }
+
+const getOnlineSalesAgents = () => getOnlineAgentsForRoles(['sales', 'admin']);
+const getOnlineSupportAgents = () => getOnlineAgentsForRoles(['support', 'admin']);
 
 /**
  * Get the Indian phone number of the agent currently on shift.
@@ -167,6 +158,12 @@ export async function POST(request: Request) {
     const to = formData.get('To') as string;
     const from = formData.get('From') as string;
     const callerId = formData.get('CallerId') as string;
+    // The CallSid Twilio assigns to this leg. For inbound PSTN calls, this is
+    // the PARENT call SID — and it's also the CallSid that will appear on the
+    // <Dial> recording status callback. We pass it down to the agent's browser
+    // as a <Parameter> so the inbound row in call_logs is keyed by it and the
+    // recording lookup succeeds.
+    const parentCallSid = (formData.get('CallSid') as string) || '';
     // Twilio also sends a `Direction` form field, but we infer direction
     // ourselves from From/To below since the Direction value is sometimes
     // missing for client-initiated outbound calls.
@@ -258,37 +255,27 @@ export async function POST(request: Request) {
             !toNormalized
         );
 
+        // Shared helper to append a phone-number fallback dial leg. Returns
+        // the appended <Dial> so the caller can chain `.number(...)`.
+        const appendPhoneDial = (toNumber: string, label?: string) => {
+            if (label) twiml.say({ voice: 'alice' }, label);
+            const dial = twiml.dial({
+                callerId: from || getRandomCallerId(),
+                timeout: 30,
+                record: 'record-from-answer-dual',
+                recordingStatusCallback: `${appUrl}/api/twilio/recording`,
+                recordingStatusCallbackMethod: 'POST',
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            } as any);
+            dial.number(toNumber);
+            return dial;
+        };
+
         if (isSupportCall) {
-            // ── SUPPORT inbound: forward to on-shift support agent's Indian phone ──
-            const shiftPhone = await getOnShiftPhone();
-            if (shiftPhone) {
-                twiml.say({ voice: 'alice' }, 'Please hold while we connect you to support.');
-                const dial = twiml.dial({
-                    callerId: from || getRandomCallerId(),
-                    timeout: 30,
-                    record: 'record-from-answer-dual',
-                    recordingStatusCallback: `${appUrl}/api/twilio/recording`,
-                    recordingStatusCallbackMethod: 'POST',
-                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                } as any);
-                dial.number(shiftPhone);
-            } else {
-                twiml.say(
-                    { voice: 'alice' },
-                    'Sorry, no support agents are available right now. Please try again later or leave a message after the beep.'
-                );
-                twiml.record({ maxLength: 120, transcribe: true });
-            }
-        } else if (isSalesCall) {
-            // ── SALES inbound: ring all currently-online sales agents in the
-            //    browser. Twilio rings every <Client> simultaneously and the
-            //    first to pick up wins; others stop ringing automatically.
-            //    The agent's role is `sales` AND agent_status='ready'.
-            const onlineAgents = await getOnlineSalesAgents();
+            // ── SUPPORT inbound: ring online support agents' browsers, then
+            //    fall back to the on-shift Indian phone, then voicemail.
+            const onlineAgents = await getOnlineSupportAgents();
             if (onlineAgents.length > 0) {
-                // No greeting — `answerOnBridge: true` plays standard ringback
-                // to the caller while we ring the agent browsers, which feels
-                // like a normal phone call rather than an IVR.
                 const dial = twiml.dial({
                     callerId: from || getRandomCallerId(),
                     timeout: 25,
@@ -299,23 +286,74 @@ export async function POST(request: Request) {
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any
                 } as any);
                 for (const identity of onlineAgents) {
-                    dial.client(identity);
+                    const client = dial.client(identity);
+                    // Surface the parent CallSid + true caller to the agent's
+                    // browser so the call_logs row is keyed correctly.
+                    if (parentCallSid) {
+                        client.parameter({ name: 'parentCallSid', value: parentCallSid });
+                    }
+                    if (from) client.parameter({ name: 'callerFrom', value: from });
+                    if (to) client.parameter({ name: 'calledTo', value: to });
+                    client.parameter({ name: 'callDirection', value: 'inbound' });
+                    client.parameter({ name: 'callQueue', value: 'support' });
                 }
-                // If no agent picks up within the timeout, fall through to
-                // voicemail (the <Say> + <Record> below execute when <Dial>
-                // ends without an answered call).
-                twiml.say(
-                    { voice: 'alice' },
-                    "Sorry, our sales agents didn't pick up. Please leave a brief message after the beep and we'll call you back."
-                );
-                twiml.record({ maxLength: 120, transcribe: true });
-            } else {
-                twiml.say(
-                    { voice: 'alice' },
-                    'Sorry, no sales agents are available right now. Please leave a message after the beep and we will call you back.'
-                );
-                twiml.record({ maxLength: 120, transcribe: true });
             }
+            // Second leg: on-shift agent's phone (if any). Twilio only reaches
+            // this if the <Client> dial above didn't connect (or wasn't emitted).
+            const shiftPhone = await getOnShiftPhone();
+            if (shiftPhone) {
+                appendPhoneDial(
+                    shiftPhone,
+                    onlineAgents.length > 0
+                        ? undefined
+                        : 'Please hold while we connect you to support.',
+                );
+            }
+            // Final leg: voicemail.
+            twiml.say(
+                { voice: 'alice' },
+                "Sorry, no support agents are available right now. Please leave a message after the beep and we'll call you back."
+            );
+            twiml.record({ maxLength: 120, transcribe: true });
+        } else if (isSalesCall) {
+            // ── SALES inbound: ring online sales agents in the browser, then
+            //    fall back to the configured Indian sales-agent phone, then
+            //    voicemail. No spoken greeting — `answerOnBridge` keeps
+            //    normal ringback playing to the caller.
+            const onlineAgents = await getOnlineSalesAgents();
+            if (onlineAgents.length > 0) {
+                const dial = twiml.dial({
+                    callerId: from || getRandomCallerId(),
+                    timeout: 25,
+                    record: 'record-from-answer-dual',
+                    recordingStatusCallback: `${appUrl}/api/twilio/recording`,
+                    recordingStatusCallbackMethod: 'POST',
+                    answerOnBridge: true,
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                } as any);
+                for (const identity of onlineAgents) {
+                    const client = dial.client(identity);
+                    if (parentCallSid) {
+                        client.parameter({ name: 'parentCallSid', value: parentCallSid });
+                    }
+                    if (from) client.parameter({ name: 'callerFrom', value: from });
+                    if (to) client.parameter({ name: 'calledTo', value: to });
+                    client.parameter({ name: 'callDirection', value: 'inbound' });
+                    client.parameter({ name: 'callQueue', value: 'sales' });
+                }
+            }
+            // Second leg: dial the Indian sales-agent fallback phone.
+            const salesFallback = (process.env.SALES_FALLBACK_PHONE
+                || '+919614308316').replace(/\s/g, '');
+            if (salesFallback) {
+                appendPhoneDial(salesFallback);
+            }
+            // Final leg: voicemail.
+            twiml.say(
+                { voice: 'alice' },
+                "Sorry, our sales agents didn't pick up. Please leave a brief message after the beep and we'll call you back."
+            );
+            twiml.record({ maxLength: 120, transcribe: true });
         } else {
             // Unknown number — shouldn't happen, but fail safely with voicemail.
             twiml.say({ voice: 'alice' }, 'Please leave a message after the beep.');

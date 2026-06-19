@@ -36,10 +36,21 @@ export async function GET() {
         }
     }
 
-    const enriched = (data || []).map(d => ({
-        ...d,
-        agent_name: profiles[d.agent_id] || 'Unknown',
-    }));
+    // Treat any 'ready' row whose last_updated is older than the staleness
+    // cutoff as actually 'offline'. This catches closed-browser / asleep-
+    // laptop sessions that never sent us a clean 'offline' update.
+    const STALE_AFTER_MS = 30 * 60 * 1000; // 30 minutes
+    const now = Date.now();
+    const enriched = (data || []).map((d) => {
+        const updatedAt = d.last_updated ? new Date(d.last_updated).getTime() : 0;
+        const isStale = updatedAt > 0 && now - updatedAt > STALE_AFTER_MS;
+        return {
+            ...d,
+            status: isStale && d.status !== 'offline' ? 'offline' : d.status,
+            stale: isStale,
+            agent_name: profiles[d.agent_id] || 'Unknown',
+        };
+    });
 
     return NextResponse.json({ statuses: enriched });
 }

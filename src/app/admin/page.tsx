@@ -70,13 +70,32 @@ interface DncEntry {
 }
 
 interface Analytics {
+    lifetimeTotalCalls: number;
+    range: { from: string; to: string; tz: string };
     totalCalls: number;
+    answeredCalls: number;
     avgDuration: number;
     totalDuration: number;
+    longestDuration: number;
+    connectRate: number;
     dispositions: Record<string, number>;
     directions: Record<string, number>;
     callsPerDay: Record<string, number>;
-    agentPerformance: { name: string; calls: number; avgDuration: number }[];
+    agentPerformance: {
+        name: string;
+        calls: number;
+        answered: number;
+        avgDuration: number;
+        connectRate: number;
+        totalTalkTime: number;
+    }[];
+}
+
+/** Build a YYYY-MM-DD string for `daysAgo` days before today (local time). */
+function isoDaysAgo(daysAgo: number): string {
+    const d = new Date();
+    d.setDate(d.getDate() - daysAgo);
+    return d.toISOString().split('T')[0];
 }
 
 export default function AdminPage() {
@@ -305,6 +324,16 @@ export default function AdminPage() {
     const [dncPhone, setDncPhone] = useState('');
     const [dncReason, setDncReason] = useState('');
     const [analytics, setAnalytics] = useState<Analytics | null>(null);
+    // Analytics date range — defaults to the last 30 days. `analyticsFrom`/`To`
+    // are YYYY-MM-DD strings the date inputs bind to; the API call is debounced
+    // by `analyticsRefreshKey` so we don't re-fetch on every keystroke.
+    const [analyticsFrom, setAnalyticsFrom] = useState<string>(isoDaysAgo(29));
+    const [analyticsTo, setAnalyticsTo] = useState<string>(isoDaysAgo(0));
+    const [analyticsLoading, setAnalyticsLoading] = useState(false);
+    // Call-logs pagination state.
+    const [callLogsTotal, setCallLogsTotal] = useState(0);
+    const [callLogsLimit, setCallLogsLimit] = useState(1000);
+    const [callLogsLoading, setCallLogsLoading] = useState(false);
     const [knownColumns, setKnownColumns] = useState<string[]>([]);
     const [cardConfig, setCardConfig] = useState<CallCardField[]>([]);
     const [cardSaved, setCardSaved] = useState(false);
@@ -323,15 +352,20 @@ export default function AdminPage() {
         if (data) setAgents(data);
     }, []);
 
-    const fetchAllLogs = useCallback(async () => {
+    const fetchAllLogs = useCallback(async (limit?: number) => {
+        setCallLogsLoading(true);
         try {
-            const res = await fetch('/api/call-logs');
+            const useLimit = limit ?? callLogsLimit;
+            const res = await fetch(`/api/call-logs?limit=${useLimit}`);
             const json = await res.json();
             if (json.logs) setCallLogs(json.logs as CallLogEntry[]);
+            if (typeof json.total === 'number') setCallLogsTotal(json.total);
         } catch (err) {
             console.error('Failed to fetch call logs:', err);
+        } finally {
+            setCallLogsLoading(false);
         }
-    }, []);
+    }, [callLogsLimit]);
 
     const fetchAgentStatuses = useCallback(async () => {
         try {
@@ -349,13 +383,20 @@ export default function AdminPage() {
         } catch { }
     }, []);
 
-    const fetchAnalytics = useCallback(async () => {
+    const fetchAnalytics = useCallback(async (from?: string, to?: string) => {
+        setAnalyticsLoading(true);
         try {
-            const res = await fetch('/api/analytics');
+            const f = from ?? analyticsFrom;
+            const t = to ?? analyticsTo;
+            const res = await fetch(`/api/analytics?from=${f}&to=${t}`);
             const json = await res.json();
             setAnalytics(json);
-        } catch { }
-    }, []);
+        } catch {
+            // ignore — keep last good data
+        } finally {
+            setAnalyticsLoading(false);
+        }
+    }, [analyticsFrom, analyticsTo]);
 
     useEffect(() => {
         if (isAdmin) {
@@ -596,6 +637,46 @@ export default function AdminPage() {
 
     const formatDuration = fmtDur;
 
+    /** Aggregate talk-time formatter — switches to "Hh Mm" past an hour. */
+    const formatTalkTime = (seconds: number) => {
+        const s = Math.max(0, Math.round(seconds));
+        if (s < 60) return `${s}s`;
+        if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
+        const h = Math.floor(s / 3600);
+        const m = Math.floor((s % 3600) / 60);
+        return `${h}h ${m}m`;
+    };
+
+    /** Convert raw disposition keys to a friendlier display label. */
+    const prettyDispo = (d: string) => {
+        if (!d) return 'Unknown';
+        const map: Record<string, string> = {
+            completed: 'Completed',
+            answered: 'Answered',
+            'no-answer': 'No answer',
+            no_answer: 'No answer',
+            missed: 'Missed',
+            busy: 'Busy',
+            failed: 'Failed',
+            canceled: 'Canceled',
+            cancelled: 'Canceled',
+            voicemail: 'Voicemail',
+            transferred: 'Transferred',
+            unknown: 'Unknown',
+        };
+        return map[d.toLowerCase()] || d.charAt(0).toUpperCase() + d.slice(1);
+    };
+
+    /** Color the disposition bar so good/bad outcomes are immediately legible. */
+    const dispoColor = (d: string) => {
+        const k = (d || '').toLowerCase();
+        if (k === 'completed' || k === 'answered') return '#10b981';     // green
+        if (k === 'voicemail' || k === 'transferred') return '#3b82f6';  // blue
+        if (k === 'no-answer' || k === 'no_answer' || k === 'missed') return '#f59e0b'; // amber
+        if (k === 'busy' || k === 'failed' || k === 'canceled' || k === 'cancelled') return '#ef4444'; // red
+        return 'var(--accent)';
+    };
+
     const statusColor = (status: string) => {
         switch (status) {
             case 'ready': return '#10b981';
@@ -678,78 +759,185 @@ export default function AdminPage() {
                 {/* Analytics Section */}
                 {activeSection === 'analytics' && analytics && (
                     <div className="leads-page">
-                        <h2 style={{ fontSize: 18, marginBottom: 16, display: 'flex', alignItems: 'center', gap: 8 }}>
-                            <BarChart3 {...ICON_DEFAULTS} size={18} /> Call Analytics
-                        </h2>
+                        <div className="leads-toolbar" style={{ alignItems: 'flex-end', flexWrap: 'wrap' }}>
+                            <h2 style={{ flex: 1, fontSize: 18, display: 'flex', alignItems: 'center', gap: 8 }}>
+                                <BarChart3 {...ICON_DEFAULTS} size={18} /> Call Analytics
+                            </h2>
 
-                        {/* Stats Cards */}
+                            {/* Quick-range presets */}
+                            <div style={{ display: 'flex', gap: 6 }}>
+                                {[
+                                    { label: 'Today', from: isoDaysAgo(0), to: isoDaysAgo(0) },
+                                    { label: '7d', from: isoDaysAgo(6), to: isoDaysAgo(0) },
+                                    { label: '30d', from: isoDaysAgo(29), to: isoDaysAgo(0) },
+                                    { label: '90d', from: isoDaysAgo(89), to: isoDaysAgo(0) },
+                                ].map((p) => (
+                                    <button
+                                        key={p.label}
+                                        type="button"
+                                        className={`btn-secondary ${analyticsFrom === p.from && analyticsTo === p.to ? 'btn-active' : ''}`}
+                                        onClick={() => {
+                                            setAnalyticsFrom(p.from);
+                                            setAnalyticsTo(p.to);
+                                            fetchAnalytics(p.from, p.to);
+                                        }}
+                                    >
+                                        {p.label}
+                                    </button>
+                                ))}
+                            </div>
+
+                            {/* Custom range */}
+                            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                                <label style={{ fontSize: 12, color: 'var(--text-muted)' }}>From</label>
+                                <input
+                                    type="date"
+                                    value={analyticsFrom}
+                                    max={analyticsTo}
+                                    onChange={(e) => setAnalyticsFrom(e.target.value)}
+                                    style={{ padding: '6px 8px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--text)' }}
+                                />
+                                <label style={{ fontSize: 12, color: 'var(--text-muted)' }}>To</label>
+                                <input
+                                    type="date"
+                                    value={analyticsTo}
+                                    min={analyticsFrom}
+                                    max={isoDaysAgo(0)}
+                                    onChange={(e) => setAnalyticsTo(e.target.value)}
+                                    style={{ padding: '6px 8px', borderRadius: 6, border: '1px solid var(--border)', background: 'var(--bg)', color: 'var(--text)' }}
+                                />
+                                <button
+                                    type="button"
+                                    className="btn-primary"
+                                    onClick={() => fetchAnalytics(analyticsFrom, analyticsTo)}
+                                    disabled={analyticsLoading}
+                                >
+                                    <RotateCcw {...ICON_DEFAULTS} size={14} /> {analyticsLoading ? 'Loading…' : 'Apply'}
+                                </button>
+                            </div>
+                        </div>
+
+                        <p style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 0, marginBottom: 12 }}>
+                            Showing data from <strong>{analytics.range.from}</strong> to <strong>{analytics.range.to}</strong>
+                            {' · '}lifetime calls in DB: <strong>{analytics.lifetimeTotalCalls.toLocaleString()}</strong>
+                        </p>
+
+                        {/* Stats Cards — 6 metrics for at-a-glance health */}
                         <div className="admin-stats-grid">
                             <div className="admin-stat-card">
-                                <div className="admin-stat-number">{analytics.totalCalls}</div>
+                                <div className="admin-stat-number">{analytics.totalCalls.toLocaleString()}</div>
                                 <div className="admin-stat-label">Total Calls</div>
                             </div>
                             <div className="admin-stat-card">
-                                <div className="admin-stat-number">{formatDuration(analytics.avgDuration)}</div>
-                                <div className="admin-stat-label">Avg Duration</div>
+                                <div className="admin-stat-number">{analytics.answeredCalls.toLocaleString()}</div>
+                                <div className="admin-stat-label">Answered</div>
                             </div>
                             <div className="admin-stat-card">
-                                <div className="admin-stat-number">{analytics.directions?.outbound || 0}</div>
+                                <div className="admin-stat-number">{analytics.connectRate}%</div>
+                                <div className="admin-stat-label">Connect Rate</div>
+                            </div>
+                            <div className="admin-stat-card">
+                                <div className="admin-stat-number">{formatDuration(analytics.avgDuration)}</div>
+                                <div className="admin-stat-label">Avg Talk / Call</div>
+                            </div>
+                            <div className="admin-stat-card">
+                                <div className="admin-stat-number">{formatTalkTime(analytics.totalDuration)}</div>
+                                <div className="admin-stat-label">Total Talk Time</div>
+                            </div>
+                            <div className="admin-stat-card">
+                                <div className="admin-stat-number">{formatDuration(analytics.longestDuration)}</div>
+                                <div className="admin-stat-label">Longest Call</div>
+                            </div>
+                            <div className="admin-stat-card">
+                                <div className="admin-stat-number">{(analytics.directions?.outbound || 0).toLocaleString()}</div>
                                 <div className="admin-stat-label">Outbound</div>
                             </div>
                             <div className="admin-stat-card">
-                                <div className="admin-stat-number">{analytics.directions?.inbound || 0}</div>
+                                <div className="admin-stat-number">{(analytics.directions?.inbound || 0).toLocaleString()}</div>
                                 <div className="admin-stat-label">Inbound</div>
                             </div>
                         </div>
 
                         {/* Calls Per Day Chart */}
                         <div className="admin-chart-card">
-                            <h3>Calls Per Day (Last 30 Days)</h3>
-                            <div className="admin-bar-chart">
-                                {Object.entries(analytics.callsPerDay).map(([day, count]) => (
-                                    <div key={day} className="admin-bar-col">
-                                        <div className="admin-bar-value">{count > 0 ? count : ''}</div>
-                                        <div
-                                            className="admin-bar"
-                                            style={{ height: `${(count / maxCallsPerDay) * 100}%` }}
-                                        />
-                                        <div className="admin-bar-label">{day.slice(5)}</div>
-                                    </div>
-                                ))}
-                            </div>
+                            <h3>Calls Per Day</h3>
+                            {Object.values(analytics.callsPerDay).every((v) => v === 0) ? (
+                                <p style={{ color: 'var(--text-muted)', fontSize: 13 }}>No calls in this range yet.</p>
+                            ) : (
+                                <div className="admin-bar-chart">
+                                    {Object.entries(analytics.callsPerDay).map(([day, count]) => (
+                                        <div key={day} className="admin-bar-col" title={`${day}: ${count} calls`}>
+                                            <div className="admin-bar-value">{count > 0 ? count : ''}</div>
+                                            <div
+                                                className="admin-bar"
+                                                style={{ height: `${(count / maxCallsPerDay) * 100}%` }}
+                                            />
+                                            <div className="admin-bar-label">{day.slice(5)}</div>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
                         </div>
 
                         {/* Disposition Breakdown + Agent Performance */}
                         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginTop: 16 }}>
                             <div className="admin-chart-card">
                                 <h3>Disposition Breakdown</h3>
-                                <div className="admin-dispo-list">
-                                    {Object.entries(analytics.dispositions).sort((a, b) => b[1] - a[1]).map(([dispo, count]) => (
-                                        <div key={dispo} className="admin-dispo-item">
-                                            <span className="admin-dispo-name">{dispo}</span>
-                                            <div className="admin-dispo-bar-bg">
-                                                <div className="admin-dispo-bar" style={{ width: `${(count / analytics.totalCalls) * 100}%` }} />
-                                            </div>
-                                            <span className="admin-dispo-count">{count}</span>
-                                        </div>
-                                    ))}
-                                </div>
+                                {Object.keys(analytics.dispositions).length === 0 ? (
+                                    <p style={{ color: 'var(--text-muted)', fontSize: 13 }}>No dispositions logged yet.</p>
+                                ) : (
+                                    <div className="admin-dispo-list">
+                                        {Object.entries(analytics.dispositions).sort((a, b) => b[1] - a[1]).map(([dispo, count]) => {
+                                            // Bar width is relative to the largest count, so even rare
+                                            // dispositions show up visually.
+                                            const maxCount = Math.max(...Object.values(analytics.dispositions), 1);
+                                            return (
+                                                <div key={dispo} className="admin-dispo-item">
+                                                    <span className="admin-dispo-name">{prettyDispo(dispo)}</span>
+                                                    <div className="admin-dispo-bar-bg">
+                                                        <div
+                                                            className="admin-dispo-bar"
+                                                            style={{
+                                                                width: `${(count / maxCount) * 100}%`,
+                                                                background: dispoColor(dispo),
+                                                            }}
+                                                        />
+                                                    </div>
+                                                    <span className="admin-dispo-count">
+                                                        {count} · {analytics.totalCalls > 0 ? Math.round((count / analytics.totalCalls) * 100) : 0}%
+                                                    </span>
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                )}
                             </div>
                             <div className="admin-chart-card">
                                 <h3>Agent Performance</h3>
-                                <div className="admin-dispo-list">
-                                    {analytics.agentPerformance.map(a => (
-                                        <div key={a.name} className="admin-dispo-item">
-                                            <span className="admin-dispo-name">{a.name}</span>
-                                            <span className="admin-dispo-count">{a.calls} calls, avg {formatDuration(a.avgDuration)}</span>
-                                        </div>
-                                    ))}
-                                    {analytics.agentPerformance.length === 0 && (
-                                        <p style={{ color: 'var(--text-muted)', fontSize: 13 }}>No data yet</p>
-                                    )}
-                                </div>
+                                {analytics.agentPerformance.length === 0 ? (
+                                    <p style={{ color: 'var(--text-muted)', fontSize: 13 }}>No agent activity in this range.</p>
+                                ) : (
+                                    <div className="admin-dispo-list">
+                                        {analytics.agentPerformance.map((a) => (
+                                            <div key={a.name} className="admin-dispo-item" style={{ flexDirection: 'column', alignItems: 'stretch' }}>
+                                                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+                                                    <span className="admin-dispo-name" style={{ fontWeight: 600 }}>{a.name}</span>
+                                                    <span className="admin-dispo-count">{a.calls} calls</span>
+                                                </div>
+                                                <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
+                                                    {a.answered} answered · {a.connectRate}% connect · avg {formatDuration(a.avgDuration)} · total {formatTalkTime(a.totalTalkTime)}
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
                             </div>
                         </div>
+                    </div>
+                )}
+                {activeSection === 'analytics' && !analytics && (
+                    <div className="leads-page">
+                        <p style={{ color: 'var(--text-muted)', padding: 20 }}>Loading analytics…</p>
                     </div>
                 )}
 
@@ -923,9 +1111,34 @@ export default function AdminPage() {
                     const distinctDispositions = Array.from(
                         new Set(callLogs.map((l) => l.disposition).filter(Boolean) as string[]),
                     );
+                    const hasMore = callLogsTotal > callLogs.length;
                     return (
                         <div className="logs-page">
-                            <h2 style={{ fontSize: 18, marginBottom: 12 }}>All Agent Call Logs</h2>
+                            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12, flexWrap: 'wrap', gap: 8 }}>
+                                <h2 style={{ fontSize: 18, margin: 0 }}>All Agent Call Logs</h2>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: 'var(--text-muted)' }}>
+                                    <span>
+                                        Loaded <strong>{callLogs.length.toLocaleString()}</strong> of{' '}
+                                        <strong>{callLogsTotal.toLocaleString()}</strong> total
+                                    </span>
+                                    {hasMore && (
+                                        <button
+                                            className="btn-secondary"
+                                            disabled={callLogsLoading}
+                                            onClick={() => {
+                                                const next = Math.min(callLogsLimit + 2000, 10000);
+                                                setCallLogsLimit(next);
+                                                fetchAllLogs(next);
+                                            }}
+                                        >
+                                            {callLogsLoading ? 'Loading…' : `Load ${Math.min(2000, callLogsTotal - callLogs.length).toLocaleString()} more`}
+                                        </button>
+                                    )}
+                                    <button className="btn-secondary" onClick={() => fetchAllLogs()} disabled={callLogsLoading}>
+                                        <RotateCcw {...ICON_DEFAULTS} size={12} /> Refresh
+                                    </button>
+                                </div>
+                            </div>
                             <CallLogFilters
                                 value={logFilter}
                                 onChange={setLogFilter}

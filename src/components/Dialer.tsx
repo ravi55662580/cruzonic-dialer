@@ -33,11 +33,15 @@ interface DialerProps {
      *   'completed' — call was answered, has real talk-time duration
      *   'no-answer' — rang but never accepted; duration will be 0
      *   'failed'    — Twilio error before or during the call
+     * `direction` and `number` are emitted so the parent can log inbound rows
+     * correctly without having to track the incoming-call state itself.
      */
     onCallEnd?: (
         duration: number,
         callSid: string,
         disposition?: 'completed' | 'no-answer' | 'failed',
+        direction?: 'inbound' | 'outbound',
+        number?: string,
     ) => void;
     onStatusChange?: (status: AgentStatus) => void;
     /**
@@ -196,6 +200,10 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
      *  answered — we log it as no-answer with duration 0 instead of
      *  inheriting the previous call's duration. */
     const wasAcceptedRef = useRef(false);
+    /** Inbound-only refs — captured on accept so the disconnect handler can
+     *  emit the right row even though `incomingCall` state has been cleared. */
+    const inboundCallerRef = useRef<string>('');
+    const inboundParentSidRef = useRef<string>('');
 
     /**
      * Disconnect whatever call is currently ringing, connecting, or active.
@@ -252,6 +260,70 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
             }).catch(() => { });
         }
     }, [agentStatus, onStatusChange, agentId, activeNumber]);
+
+    // ── Heartbeat: refresh agent_status.last_updated every 60s while the
+    //    dialer is alive and the agent isn't deliberately offline. The
+    //    server-side inbound fanout filters out 'ready' rows older than 30
+    //    min — without this ping, a closed tab would keep ringing forever.
+    useEffect(() => {
+        if (!agentId) return;
+        if (agentStatus === 'offline') return;
+        const ping = () => {
+            fetch('/api/agent-status', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    agent_id: agentId,
+                    status: agentStatus,
+                    current_call_number: activeNumber || '',
+                    current_call_sid: agentStatus === 'on-call' ? callSidRef.current : null,
+                }),
+                keepalive: true,
+            }).catch(() => { });
+        };
+        const interval = window.setInterval(ping, 60_000);
+        return () => window.clearInterval(interval);
+    }, [agentId, agentStatus, activeNumber]);
+
+    // ── Best-effort "going offline" when the tab/browser closes or the
+    //    user navigates away. Uses `keepalive: true` so the fetch survives
+    //    the page unload. Same payload as the heartbeat but with status
+    //    forced to 'offline' so the fanout drops this agent immediately.
+    useEffect(() => {
+        if (!agentId) return;
+        const markOffline = () => {
+            try {
+                fetch('/api/agent-status', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        agent_id: agentId,
+                        status: 'offline',
+                        current_call_number: '',
+                        current_call_sid: null,
+                    }),
+                    keepalive: true,
+                }).catch(() => { });
+            } catch { /* ignore */ }
+        };
+        const onVisibility = () => {
+            // Tab going to background isn't the same as closing — only mark
+            // offline if the page is actually being unloaded (handled below).
+            if (document.visibilityState === 'hidden') {
+                // Browser may persist the tab in background for a while.
+                // Don't force-offline here; the heartbeat staleness cutoff
+                // handles abandoned-tab cleanup after 30 min.
+            }
+        };
+        window.addEventListener('pagehide', markOffline);
+        window.addEventListener('beforeunload', markOffline);
+        document.addEventListener('visibilitychange', onVisibility);
+        return () => {
+            window.removeEventListener('pagehide', markOffline);
+            window.removeEventListener('beforeunload', markOffline);
+            document.removeEventListener('visibilitychange', onVisibility);
+        };
+    }, [agentId]);
 
     // Format phone number for Twilio E.164 format
     const formatE164 = (input: string): string => {
@@ -484,34 +556,81 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
 
     // Accept incoming call
     const acceptCall = () => {
-        if (incomingCall) {
-            incomingCall.accept();
-            setActiveCall(incomingCall);
-            setAgentStatus('on-call');
-            setIncomingCall(null);
-            // Inbound calls also get a transcript pane.
-            const sid = incomingCall.parameters?.CallSid || '';
-            if (sid) {
-                callSidRef.current = sid;
-                onCallSidChange?.(sid);
-            }
-            // Same as the outbound flow — find the customer's remote stream
-            // and hand it to the parent so LiveCoach can transcribe it.
-            if (onRemoteStreamChange) {
-                findTwilioRemoteStream().then((stream) => {
-                    if (stream) onRemoteStreamChange(stream);
-                }).catch(() => { /* swallow */ });
-            }
+        if (!incomingCall) return;
+        const call = incomingCall;
+        call.accept();
+        setActiveCall(call);
+        setAgentStatus('on-call');
+        setIncomingCall(null);
+        // The Voice SDK gives us the CHILD call SID (the <Client> leg).
+        // For recording-URL matching we want the PARENT call SID, which the
+        // voice route passes through as a custom <Parameter>. Twilio exposes
+        // it on either `customParameters` (Map) or `parameters` depending on
+        // SDK build — try both for safety.
+        const childSid = call.parameters?.CallSid || '';
+        const customMap = (call as Call & { customParameters?: Map<string, string> }).customParameters;
+        const parentSid =
+            customMap?.get('parentCallSid')
+            || ((call.parameters as Record<string, string> | undefined)?.parentCallSid)
+            || '';
+        const callerFrom =
+            customMap?.get('callerFrom')
+            || (call.parameters?.From || '')
+            || '';
+        // Prefer the parent SID for the call_logs row so the recording
+        // status callback's CallSid lines up. Fall back to child SID.
+        const logSid = parentSid || childSid;
+        callSidRef.current = logSid;
+        inboundParentSidRef.current = logSid;
+        inboundCallerRef.current = callerFrom.replace(/^client:/, '');
+        // Reset accept tracking + timer base so duration starts at 0.
+        wasAcceptedRef.current = true;
+        durationRef.current = 0;
+        setCallDuration(0);
+        if (logSid) onCallSidChange?.(logSid);
 
-            incomingCall.on('disconnect', () => {
-                setAgentStatus('wrap-up');
-                setActiveCall(null);
-                callSidRef.current = '';
-                onCallSidChange?.(null);
-                onRemoteStreamChange?.(null);
-                setTimeout(() => setAgentStatus('ready'), 5000);
-            });
+        // Same as the outbound flow — find the customer's remote stream
+        // and hand it to the parent so LiveCoach can transcribe it.
+        if (onRemoteStreamChange) {
+            findTwilioRemoteStream().then((stream) => {
+                if (stream) onRemoteStreamChange(stream);
+            }).catch(() => { /* swallow */ });
         }
+
+        call.on('disconnect', () => {
+            setAgentStatus('wrap-up');
+            // wasAcceptedRef is true here by construction (we only attach
+            // this handler after accept). Duration is the live timer value.
+            const durationToLog = durationRef.current;
+            const sidToLog = inboundParentSidRef.current || callSidRef.current;
+            const numberToLog = inboundCallerRef.current || '';
+            lastCallInfoRef.current = {
+                duration: durationToLog,
+                callSid: sidToLog,
+                number: numberToLog,
+            };
+            onCallEnd?.(durationToLog, sidToLog, 'completed', 'inbound', numberToLog);
+            setActiveCall(null);
+            callSidRef.current = '';
+            inboundParentSidRef.current = '';
+            inboundCallerRef.current = '';
+            wasAcceptedRef.current = false;
+            onCallSidChange?.(null);
+            onRemoteStreamChange?.(null);
+            setTimeout(() => setAgentStatus('ready'), 5000);
+        });
+
+        call.on('cancel', () => {
+            // Caller hung up before we picked up, or another agent took it.
+            // Don't log here — we never accepted.
+            setActiveCall(null);
+            callSidRef.current = '';
+            inboundParentSidRef.current = '';
+            inboundCallerRef.current = '';
+            onCallSidChange?.(null);
+            onRemoteStreamChange?.(null);
+            setAgentStatus('ready');
+        });
     };
 
     // Reject incoming call
@@ -761,18 +880,51 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
             )}
 
             {/* Incoming Call Banner */}
-            {incomingCall && (
-                <div className="incoming-banner">
-                    <div className="incoming-info">
-                        <PhoneIncoming {...ICON_DEFAULTS} size={20} />
-                        <span>Incoming Call</span>
+            {incomingCall && (() => {
+                // Twilio Call.parameters carries From/To/CallSid; for PSTN
+                // inbound, From is a phone number. For browser-to-browser
+                // (transfers, monitor calls) it'll be a `client:identity`.
+                const rawFrom = incomingCall.parameters?.From || '';
+                const isClient = rawFrom.startsWith('client:');
+                const callerLabel = isClient
+                    ? rawFrom.replace(/^client:/, '')
+                    : rawFrom
+                        ? formatPhone(rawFrom)
+                        : 'Unknown caller';
+                const toNumber = incomingCall.parameters?.To || '';
+                // For PSTN inbound, To is one of OUR Twilio numbers — tells
+                // the agent which line (sales vs support) the call came in on.
+                const calledLine = toNumber && !toNumber.startsWith('client:')
+                    ? formatPhone(toNumber)
+                    : '';
+                const isTransfer = isClient; // browser-to-browser routing
+                return (
+                    <div className={`incoming-banner ${isTransfer ? 'incoming-banner-transfer' : ''}`}>
+                        <div className="incoming-info">
+                            <span className="incoming-icon">
+                                <PhoneIncoming {...ICON_DEFAULTS} size={22} strokeWidth={2.25} />
+                            </span>
+                            <div className="incoming-text">
+                                <span className="incoming-label">
+                                    {isTransfer ? 'Incoming transfer' : 'Incoming call'}
+                                </span>
+                                <strong className="incoming-from">{callerLabel}</strong>
+                                {calledLine && (
+                                    <span className="incoming-line">to {calledLine}</span>
+                                )}
+                            </div>
+                        </div>
+                        <div className="incoming-actions">
+                            <button className="btn-accept" onClick={acceptCall} title="Accept">
+                                <Phone {...ICON_DEFAULTS} size={16} /> Accept
+                            </button>
+                            <button className="btn-reject" onClick={rejectCall} title="Reject">
+                                <PhoneOff {...ICON_DEFAULTS} size={16} /> Reject
+                            </button>
+                        </div>
                     </div>
-                    <div className="incoming-actions">
-                        <button className="btn-accept" onClick={acceptCall}>Accept</button>
-                        <button className="btn-reject" onClick={rejectCall}>Reject</button>
-                    </div>
-                </div>
-            )}
+                );
+            })()}
 
             {/* Lead Info Screen Pop — fields are admin-configurable. */}
             {leadInfo && agentStatus === 'on-call' && (
