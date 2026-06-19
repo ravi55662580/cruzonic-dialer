@@ -72,7 +72,19 @@ export async function GET(request: NextRequest) {
     });
 }
 
-// POST: Save a new call log
+/**
+ * POST /api/call-logs
+ *
+ * Behaviour: UPSERT by `call_sid` when one is provided. If a row with the
+ * same call_sid already exists (e.g. created earlier by the server-side
+ * Twilio dial-status callback), we UPDATE it in-place so the agent's
+ * browser doesn't create a duplicate row. Rows without a call_sid are
+ * always inserted (legacy behavior).
+ *
+ * The merge is forgiving: caller-provided non-empty fields win over what's
+ * already in the row. The `disposition` field also wins (so the agent's
+ * 'completed' overrides an earlier 'ringing' placeholder).
+ */
 export async function POST(request: Request) {
     if (!isConfigured()) {
         return NextResponse.json({ error: 'Database not configured' }, { status: 503 });
@@ -80,6 +92,41 @@ export async function POST(request: Request) {
 
     const body = await request.json();
     const { number, direction, duration, disposition, agent_id, agent_name, call_sid, notes } = body;
+
+    // Try to find an existing row with the same call_sid.
+    if (call_sid) {
+        const { data: existing } = await supabase
+            .from('call_logs')
+            .select('id, number, agent_id, agent_name, duration, notes')
+            .eq('call_sid', call_sid)
+            .maybeSingle();
+
+        if (existing) {
+            const patch: Record<string, unknown> = {
+                direction: direction || 'outbound',
+                disposition: disposition || 'completed',
+            };
+            // Only overwrite fields when the new value is non-empty / non-zero
+            // so we don't blow away good data with a partial update.
+            if (number) patch.number = number;
+            if (agent_id) patch.agent_id = agent_id;
+            if (agent_name) patch.agent_name = agent_name;
+            if (typeof duration === 'number' && duration > 0) patch.duration = duration;
+            if (notes) patch.notes = notes;
+
+            const { data, error } = await supabase
+                .from('call_logs')
+                .update(patch)
+                .eq('id', existing.id)
+                .select()
+                .single();
+            if (error) {
+                console.error('DB Upsert Error:', error);
+                return NextResponse.json({ error: error.message }, { status: 500 });
+            }
+            return NextResponse.json({ log: data, upserted: true });
+        }
+    }
 
     const { data, error } = await supabase
         .from('call_logs')

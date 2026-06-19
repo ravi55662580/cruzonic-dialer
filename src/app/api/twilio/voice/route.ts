@@ -265,6 +265,8 @@ export async function POST(request: Request) {
                 record: 'record-from-answer-dual',
                 recordingStatusCallback: `${appUrl}/api/twilio/recording`,
                 recordingStatusCallbackMethod: 'POST',
+                action: `${appUrl}/api/twilio/dial-status`,
+                method: 'POST',
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any
             } as any);
             dial.number(toNumber);
@@ -282,6 +284,8 @@ export async function POST(request: Request) {
                     record: 'record-from-answer-dual',
                     recordingStatusCallback: `${appUrl}/api/twilio/recording`,
                     recordingStatusCallbackMethod: 'POST',
+                    action: `${appUrl}/api/twilio/dial-status`,
+                    method: 'POST',
                     answerOnBridge: true,
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any
                 } as any);
@@ -328,6 +332,8 @@ export async function POST(request: Request) {
                     record: 'record-from-answer-dual',
                     recordingStatusCallback: `${appUrl}/api/twilio/recording`,
                     recordingStatusCallbackMethod: 'POST',
+                    action: `${appUrl}/api/twilio/dial-status`,
+                    method: 'POST',
                     answerOnBridge: true,
                     // eslint-disable-next-line @typescript-eslint/no-explicit-any
                 } as any);

@@ -148,6 +148,9 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
     const [error, setError] = useState<string>('');
     const [callStatus, setCallStatus] = useState<string>('');
     const [activeNumber, setActiveNumber] = useState<string>('');
+    /** Direction of the currently-active call. Drives the "Calling" vs "From"
+     *  label on the active-call strip and any direction-sensitive logic. */
+    const [activeDirection, setActiveDirection] = useState<'inbound' | 'outbound'>('outbound');
     const [showKeypad, setShowKeypad] = useState(false);
     const [cardConfig, setCardConfig] = useState<CallCardField[]>([]);
 
@@ -195,6 +198,11 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
     // this because `activeCall` state isn't set until the 'accept' event,
     // so calls that are still ringing previously had no hang-up handle.
     const currentCallRef = useRef<Call | null>(null);
+    // Mirrors `activeCall` state so the mute/hang-up handlers can read the
+    // current call without depending on React having committed the state
+    // update — handy for inbound, where a clicked Mute can race the accept
+    // commit and silently no-op against a stale-null `activeCall`.
+    const activeCallRef = useRef<Call | null>(null);
     /** True once the customer (or our SDK) actually accepted the call. If
      *  it stays false through `disconnect`, the call rang but was never
      *  answered — we log it as no-answer with duration 0 instead of
@@ -210,14 +218,42 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
      * Called by the local Hang Up button and by PowerDialer (via the ref).
      */
     const performHangUp = useCallback(() => {
-        const call = activeCall || currentCallRef.current;
-        if (!call) return;
+        // Prefer the ref values so the handler works even if the React state
+        // update from accept/incoming hasn't committed yet by the time the
+        // user clicks Hang Up.
+        const call = activeCallRef.current || activeCall || currentCallRef.current;
+        if (!call) {
+            console.warn('[dialer] hang-up clicked but no live call to disconnect');
+            return;
+        }
         try {
             call.disconnect();
         } catch (err) {
             console.error('Hang up failed:', err);
         }
         currentCallRef.current = null;
+    }, [activeCall]);
+
+    // Toggle mute — uses the ref-mirrored active call so it works for both
+    // inbound and outbound regardless of React batching order.
+    const toggleMute = useCallback(() => {
+        const call = activeCallRef.current || activeCall;
+        if (!call) {
+            console.warn('[dialer] mute clicked but no live call');
+            return;
+        }
+        const newMuted = !isMuted;
+        try {
+            call.mute(newMuted);
+            setIsMuted(newMuted);
+        } catch (err) {
+            console.error('Mute toggle failed:', err);
+        }
+    }, [activeCall, isMuted]);
+
+    // Keep the ref in lock-step with the state mirror.
+    useEffect(() => {
+        activeCallRef.current = activeCall;
     }, [activeCall]);
 
     // Expose makeCall, getStatus, hangUp and getLastCallInfo to parent via ref
@@ -374,6 +410,31 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
 
             newDevice.on('incoming', (call: Call) => {
                 setIncomingCall(call);
+
+                // If the caller hangs up before we pick up — or another
+                // agent in the fanout accepted the call first — Twilio
+                // fires `cancel` on this end. Without these listeners the
+                // incoming banner stayed on screen indefinitely (and the
+                // missed-call row was never logged client-side; the server
+                // dial-status callback still creates one).
+                const clearBanner = () => {
+                    setIncomingCall((current) => (current === call ? null : current));
+                    // Don't touch agentStatus if we already accepted — the
+                    // accept handler owns the on-call → wrap-up transition.
+                    setAgentStatus((s) => (s === 'connecting' ? 'ready' : s));
+                };
+                call.on('cancel', clearBanner);
+                // `disconnect` fires for a never-accepted call if Twilio
+                // bridges to another leg and ours is dropped. `reject` is
+                // our own UI action — rejectCall already handles cleanup,
+                // but wiring it here too makes the banner robust against
+                // unexpected reject flows from the SDK.
+                call.on('disconnect', () => {
+                    // Only clear if we never accepted. Once accepted,
+                    // acceptCall's own disconnect handler runs.
+                    if (!wasAcceptedRef.current) clearBanner();
+                });
+                call.on('reject', clearBanner);
             });
 
             newDevice.on('error', (err) => {
@@ -458,6 +519,7 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
             setError('');
             setCallStatus('Connecting...');
             setActiveNumber(e164Number);
+            setActiveDirection('outbound');
             const call = await device.connect({
                 params: {
                     To: e164Number,
@@ -559,6 +621,11 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
         if (!incomingCall) return;
         const call = incomingCall;
         call.accept();
+        // Populate the refs FIRST so the mute / hang-up buttons that render
+        // on the next tick already have a live handle, before React has
+        // committed the state updates below.
+        activeCallRef.current = call;
+        currentCallRef.current = call;
         setActiveCall(call);
         setAgentStatus('on-call');
         setIncomingCall(null);
@@ -582,7 +649,13 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
         const logSid = parentSid || childSid;
         callSidRef.current = logSid;
         inboundParentSidRef.current = logSid;
-        inboundCallerRef.current = callerFrom.replace(/^client:/, '');
+        const cleanCaller = callerFrom.replace(/^client:/, '');
+        inboundCallerRef.current = cleanCaller;
+        // Surface the caller's number on the on-call strip — without this,
+        // the agent sees no caller ID once they accept and the incoming
+        // banner disappears.
+        setActiveNumber(cleanCaller);
+        setActiveDirection('inbound');
         // Reset accept tracking + timer base so duration starts at 0.
         wasAcceptedRef.current = true;
         durationRef.current = 0;
@@ -611,6 +684,9 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
             };
             onCallEnd?.(durationToLog, sidToLog, 'completed', 'inbound', numberToLog);
             setActiveCall(null);
+            setActiveNumber('');
+            activeCallRef.current = null;
+            currentCallRef.current = null;
             callSidRef.current = '';
             inboundParentSidRef.current = '';
             inboundCallerRef.current = '';
@@ -622,8 +698,12 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
 
         call.on('cancel', () => {
             // Caller hung up before we picked up, or another agent took it.
-            // Don't log here — we never accepted.
+            // Don't log here — the server-side dial status callback owns the
+            // "missed call" row for the inbound parent.
             setActiveCall(null);
+            setActiveNumber('');
+            activeCallRef.current = null;
+            currentCallRef.current = null;
             callSidRef.current = '';
             inboundParentSidRef.current = '';
             inboundCallerRef.current = '';
@@ -645,15 +725,6 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
     // ringing, connecting, and answered calls.
     const hangUp = () => {
         performHangUp();
-    };
-
-    // Mute/unmute
-    const toggleMute = () => {
-        if (activeCall) {
-            const newMuted = !isMuted;
-            activeCall.mute(newMuted);
-            setIsMuted(newMuted);
-        }
     };
 
     // ── Call transfer (warm) ──────────────────────────────────────────
@@ -863,10 +934,15 @@ const Dialer = forwardRef<DialerHandle, DialerProps>(function Dialer({ onCallSta
                 )}
             </div>
 
-            {/* Active Call Number Display */}
+            {/* Active Call Number Display — label flips on direction so the
+                agent immediately sees who's on the line for inbound. */}
             {(agentStatus === 'on-call' || callStatus) && activeNumber && (
-                <div className="active-call-info">
-                    <span className="active-call-label"><Phone {...ICON_DEFAULTS} size={14} /> Calling</span>
+                <div className={`active-call-info ${activeDirection === 'inbound' ? 'active-call-info-inbound' : ''}`}>
+                    <span className="active-call-label">
+                        {activeDirection === 'inbound'
+                            ? <><PhoneIncoming {...ICON_DEFAULTS} size={14} /> Call from</>
+                            : <><Phone {...ICON_DEFAULTS} size={14} /> Calling</>}
+                    </span>
                     <span className="active-call-number">{formatPhone(activeNumber)}</span>
                 </div>
             )}
